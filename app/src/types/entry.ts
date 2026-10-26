@@ -1,0 +1,23 @@
+export type EntryKind = 'task' | 'event' | 'routine' | 'note';
+export type TaskStatus = 'todo' | 'doing' | 'done';
+export type Priority = 'low' | 'normal' | 'high';
+export type ThemeName = 'energy' | 'nature' | 'the-anh';
+export type Entry = {
+  id: string;
+  kind: EntryKind;
+  title: string;
+  body: string;
+  status: TaskStatus;
+  priority: Priority;
+  color: string;
+  dueAt?: string;
+  reminderAt?: string;
+  reminderChoice?: 'hour' | 'evening' | 'tomorrow';
+  notificationId?: string;
+  repeat?: 'none' | 'daily' | 'weekly';
+  imageUris: string[];
+  audioUri?: string;
+  transcript?: string;
+  createdAt: string;
+};
+export type AppData = { entries: Entry[]; theme: ThemeName };

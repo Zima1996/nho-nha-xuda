@@ -1,0 +1,16 @@
+{
+  "id": "/",
+  "name": "Nhớ nha Xuda",
+  "short_name": "Nhớ nha Xuda",
+  "description": "Ghi nhanh việc cần nhớ, ghi chú và nhắc nhở cá nhân.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "theme_color": "#101318",
+  "background_color": "#101318",
+  "icons": [
+    { "src": "./pwa-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "./pwa-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

@@ -1,0 +1,77 @@
+{
+  "expo": {
+    "name": "Nhớ nha Xuda",
+    "slug": "nho-nha",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/icon.png",
+    "scheme": "nhonha",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "icon": "./assets/images/icon.png",
+      "supportsTablet": true,
+      "bundleIdentifier": "com.codex.nhonha"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#F3D36A",
+        "foregroundImage": "./assets/images/android-icon-foreground.png",
+        "monochromeImage": "./assets/images/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "package": "com.codex.nhonha"
+    },
+    "web": {
+      "output": "static",
+      "favicon": "./assets/images/favicon.png",
+      "name": "Nhớ nha Xuda",
+      "shortName": "Nhớ nha Xuda"
+    },
+    "plugins": [
+      [
+        "expo-router",
+        {
+          "headers": {
+            "Cross-Origin-Embedder-Policy": "credentialless",
+            "Cross-Origin-Opener-Policy": "same-origin"
+          }
+        }
+      ],
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#FFF7F1",
+          "image": "./assets/images/splash-icon.png",
+          "imageWidth": 76
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Cho phép Nhớ nha Xuda thêm ảnh vào ghi chú của bạn.",
+          "cameraPermission": "Cho phép Nhớ nha Xuda chụp ảnh để lưu vào ghi chú.",
+          "microphonePermission": false
+        }
+      ],
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "Cho phép Nhớ nha Xuda ghi âm lời nhắc và ghi chú của bạn."
+        }
+      ],
+      [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "Cho phép Nhớ nha Xuda ghi âm khi bạn yêu cầu.",
+          "speechRecognitionPermission": "Cho phép Nhớ nha Xuda chuyển bản ghi âm thành văn bản tiếng Việt."
+        }
+      ],
+      "expo-sqlite",
+      "expo-notifications"
+    ],
+    "experiments": {
+      "typedRoutes": true,
+      "reactCompiler": true
+    }
+  }
+}
