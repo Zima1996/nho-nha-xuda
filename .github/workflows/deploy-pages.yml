@@ -35,6 +35,8 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Build static PWA
         working-directory: app
+        env:
+          EXPO_PUBLIC_GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
         run: pnpm exec expo export --platform web
       - name: Keep Expo asset directory on GitHub Pages
         working-directory: app

@@ -13,6 +13,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { entryColorOptions, palettes } from '@/constants/palettes';
 import { AudioPlayback } from '@/components/AudioPlayback';
 import { loadAppData, saveAppData, starterData } from '@/data/local-store';
+import { getGoogleAccountEmail, requestGoogleAccessToken, syncGoogleCalendar } from '@/services/google-calendar';
 import type { AppData, Entry, EntryKind, ThemeName } from '@/types/entry';
 
 type Tab = 'today' | 'notes' | 'calendar' | 'settings';
@@ -77,6 +78,8 @@ export default function HomeScreen() {
   const [tab, setTab] = useState<Tab>('today');
   const [data, setData] = useState<AppData>(starterData);
   const [ready, setReady] = useState(false);
+  const [googleAccessToken, setGoogleAccessToken] = useState<string>();
+  const [googleBusy, setGoogleBusy] = useState(false);
   const [petSeed, setPetSeed] = useState(0);
   useEffect(() => { const timer = setTimeout(() => setPetSeed(Math.random()), 0); return () => clearTimeout(timer); }, []);
   const [query, setQuery] = useState('');
@@ -157,6 +160,43 @@ export default function HomeScreen() {
         ? current.entries.map((entry) => entry.id === item.id ? item : entry)
         : [item, ...current.entries],
     }));
+  }
+  async function connectGoogle() {
+    const clientId = process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID;
+    if (!clientId) {
+      Alert.alert('Cần cấu hình Google', 'Mã ứng dụng Google chưa được thêm vào GitHub. Mình sẽ hướng dẫn bạn tạo và cài mã này sau khi chuẩn bị xong app.');
+      return;
+    }
+    setGoogleBusy(true);
+    try {
+      const token = await requestGoogleAccessToken(clientId);
+      const email = await getGoogleAccountEmail(token);
+      setGoogleAccessToken(token);
+      setData((current) => ({ ...current, googleEmail: email || current.googleEmail }));
+      Alert.alert('Đã kết nối Google', email ? `Đang dùng ${email}.` : 'Bạn đã cấp quyền Google.');
+    } catch (error) {
+      Alert.alert('Chưa đăng nhập được', error instanceof Error ? error.message : 'Hãy thử lại sau nhé.');
+    } finally { setGoogleBusy(false); }
+  }
+  async function syncCalendar() {
+    const clientId = process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID;
+    if (!clientId) {
+      Alert.alert('Cần cấu hình Google', 'Mã ứng dụng Google chưa được thêm vào GitHub. Mình sẽ hướng dẫn bạn tạo và cài mã này sau khi chuẩn bị xong app.');
+      return;
+    }
+    setGoogleBusy(true);
+    try {
+      // Tokens stay in memory; ask Google for a fresh one after the app is reopened or the token expires.
+      const token = await requestGoogleAccessToken(clientId, googleAccessToken ? '' : 'select_account');
+      const email = await getGoogleAccountEmail(token);
+      const result = await syncGoogleCalendar(token, data.entries);
+      const syncedAt = new Date().toISOString();
+      setGoogleAccessToken(token);
+      setData((current) => ({ ...current, entries: result.entries, googleEmail: email || current.googleEmail, googleLastSyncedAt: syncedAt }));
+      Alert.alert('Đã đồng bộ lịch', `Đã nhập ${result.imported} sự kiện và thêm ${result.uploaded} việc lên Google Calendar.`);
+    } catch (error) {
+      Alert.alert('Chưa đồng bộ được', error instanceof Error ? error.message : 'Hãy kiểm tra kết nối rồi thử lại nhé.');
+    } finally { setGoogleBusy(false); }
   }
   async function setReminder(item: Entry) {
     if (!item.reminderAt) return undefined;
@@ -341,7 +381,7 @@ export default function HomeScreen() {
             <View style={[s.calendarBanner, { backgroundColor: colors.surfaceAlt }]}><Text style={{ fontSize: 26 }}>🗓️</Text><View><Text style={[s.progressTitle, { color: colors.ink }]}>Hôm nay</Text><Text style={[s.progressCaption, { color: colors.muted }]}>Sự kiện và việc có giờ hẹn.</Text></View></View>
             {list.map((item) => <EntryRow key={item.id} item={item} palette={colors} petIcon={petFor(item.id, petSeed)} onOpen={() => begin(item.kind, item)} onToggle={() => put({ ...item, status: item.status === 'done' ? 'todo' : 'done' })} />)}
             {!list.length && <Empty palette={colors} emoji="☕" petIcon={petFor('empty-calendar', petSeed)} title="Lịch đang thoáng" label="＋ Ghi nhanh" onPress={() => begin('task')} />}
-            <View style={[s.integration, { borderColor: colors.line, backgroundColor: colors.surface }]}><Text style={{ fontSize: 22 }}>🌐</Text><View style={{ flex: 1 }}><Text style={[s.integrationTitle, { color: colors.ink }]}>Google Calendar</Text><Text style={[s.integrationSub, { color: colors.muted }]}>Kết nối trong phần Cài đặt.</Text></View><Text style={{ color: colors.primary, fontSize: 21 }}>○</Text></View>
+            <Pressable onPress={() => setTab('settings')} style={[s.integration, { borderColor: colors.line, backgroundColor: colors.surface }]}><Text style={{ fontSize: 22 }}>🌐</Text><View style={{ flex: 1 }}><Text style={[s.integrationTitle, { color: colors.ink }]}>Google Calendar</Text><Text style={[s.integrationSub, { color: colors.muted }]}>{data.googleEmail ? `Đã kết nối · ${data.googleEmail}` : 'Chạm để đăng nhập trong Cài đặt.'}</Text></View><Text style={{ color: colors.primary, fontSize: 21 }}>{data.googleEmail ? '✓' : '›'}</Text></Pressable>
           </>}
           {tab === 'settings' && <>
             <Text style={[s.eyebrow, { color: colors.muted }]}>GÓC CỦA BẠN</Text><Text style={[s.title, { color: colors.ink }]}>Cài đặt nhỏ xinh <Text style={{ color: colors.primary }}>⚙</Text></Text><Text style={[s.subtitle, { color: colors.muted, marginBottom: 22 }]}>Chọn cảm giác hợp với bạn.</Text>
@@ -355,13 +395,11 @@ export default function HomeScreen() {
             })}</View>
             <Text style={[s.sectionTitle, { color: colors.ink, marginTop: 24, marginBottom: 10 }]}>Tài khoản & đồng bộ</Text>
             <View style={[s.integrationBox, { backgroundColor: colors.surface, borderColor: colors.line }]}>
-              <Integration icon="" title="Đăng nhập Apple" sub="Đồng bộ riêng tư giữa thiết bị" palette={colors} onPress={() => Alert.alert('Đăng nhập Apple', 'Đăng nhập sẽ được nối sau khi cấu hình dịch vụ tài khoản.')} />
+              <Integration icon="G" title={data.googleEmail ? 'Tài khoản Google' : 'Đăng nhập Google'} sub={googleBusy ? 'Đang kết nối…' : data.googleEmail || 'Dùng tài khoản có Google Calendar'} palette={colors} onPress={connectGoogle} />
               <View style={[s.divider, { backgroundColor: colors.line }]} />
-              <Integration icon="G" title="Đăng nhập Google" sub="Dùng cùng tài khoản với Calendar" palette={colors} onPress={() => Alert.alert('Đăng nhập Google', 'Đăng nhập sẽ được nối sau khi cấu hình dịch vụ tài khoản.')} />
-              <View style={[s.divider, { backgroundColor: colors.line }]} />
-              <Integration icon="🗓️" title="Google Calendar" sub="Chưa kết nối · đồng bộ hai chiều" palette={colors} onPress={() => Alert.alert('Google Calendar', 'Đồng bộ cần cấu hình ứng dụng Google Cloud và OAuth.')} />
+              <Integration icon="🗓️" title="Google Calendar" sub={googleBusy ? 'Đang đồng bộ…' : data.googleLastSyncedAt ? `Đồng bộ gần nhất · ${new Date(data.googleLastSyncedAt).toLocaleString('vi-VN')}` : 'Chạm để đồng bộ hai chiều'} palette={colors} onPress={syncCalendar} />
             </View>
-            <Pressable onPress={() => Alert.alert('Đang lưu trên thiết bị', 'Bản đầu lưu dữ liệu cục bộ. Đồng bộ nhiều thiết bị sẽ được nối sau.')} style={[s.noteHint, { backgroundColor: colors.surfaceAlt, marginTop: 18 }]}><Text>🔒</Text><Text style={{ flex: 1, color: colors.ink, fontSize: 11 }}>Nội dung đang được lưu trên thiết bị này.</Text><Text style={{ color: colors.primaryDark }}>›</Text></Pressable>
+            <View style={[s.noteHint, { backgroundColor: colors.surfaceAlt, marginTop: 18 }]}><Text>🔒</Text><Text style={{ flex: 1, color: colors.ink, fontSize: 11 }}>Ghi chú ở trên thiết bị. Việc có giờ hẹn đồng bộ với lịch Google.</Text></View>
             <Text style={[s.version, { color: colors.muted }]}>NHỚ NHA · BẢN ĐẦU TIÊN</Text>
           </>}
         </ScrollView>

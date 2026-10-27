@@ -18,6 +18,7 @@ export type Entry = {
   imageUris: string[];
   audioUri?: string;
   transcript?: string;
+  googleEventId?: string;
   createdAt: string;
 };
-export type AppData = { entries: Entry[]; theme: ThemeName };
+export type AppData = { entries: Entry[]; theme: ThemeName; googleEmail?: string; googleLastSyncedAt?: string };

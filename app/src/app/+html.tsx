@@ -16,6 +16,7 @@ export default function Root({ children }: PropsWithChildren) {
         <meta name="apple-mobile-web-app-title" content="Nhớ nha Xuda" />
         <link rel="manifest" href="./manifest.json" />
         <link rel="apple-touch-icon" href="./apple-touch-icon.png" />
+        <script async src="https://accounts.google.com/gsi/client"></script>
         <ScrollViewStyleReset />
         {headNodes}
       </head>
