@@ -17,6 +17,19 @@ import type { AppData, Entry, EntryKind, ThemeName } from '@/types/entry';
 
 type Tab = 'today' | 'notes' | 'calendar' | 'settings';
 type Draft = Omit<Entry, 'id' | 'createdAt'>;
+type BrowserSpeechResult = { transcript: string };
+type BrowserSpeechEvent = Event & { resultIndex: number; results: ArrayLike<ArrayLike<BrowserSpeechResult> & { isFinal: boolean }> };
+type BrowserSpeechRecognition = {
+  lang: string;
+  continuous: boolean;
+  interimResults: boolean;
+  onresult: ((event: BrowserSpeechEvent) => void) | null;
+  onerror: ((event: Event & { error: string }) => void) | null;
+  onend: (() => void) | null;
+  start(): void;
+  stop(): void;
+};
+type SpeechWindow = Window & { SpeechRecognition?: new () => BrowserSpeechRecognition; webkitSpeechRecognition?: new () => BrowserSpeechRecognition };
 const KIND_LABEL: Record<EntryKind, string> = { task: 'Task', event: 'Event', routine: 'Routine', note: 'Note' };
 const KIND_ICON: Record<EntryKind, string> = { task: '☑', event: '✿', routine: '↻', note: '✎' };
 const PET_ICONS = [
@@ -76,6 +89,8 @@ export default function HomeScreen() {
   const transcriptRef = useRef('');
   const partialRef = useRef('');
   const contentBeforeTranscriptRef = useRef('');
+  const browserRecognitionRef = useRef<BrowserSpeechRecognition | null>(null);
+  const shouldRecognizeRef = useRef(false);
   const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
   const recorderState = useAudioRecorderState(recorder);
   const tablet = width >= 760;
@@ -194,22 +209,73 @@ export default function HomeScreen() {
   async function record() {
     try {
       if (recorderState.isRecording) {
+        if (Platform.OS === 'web') { shouldRecognizeRef.current = false; browserRecognitionRef.current?.stop(); }
         await recorder.stop();
         if (recorder.uri) {
           const uri = persistMedia(recorder.uri, '.m4a');
           setAudioUri(uri); setDraft((value) => ({ ...value, audioUri: uri }));
-          setTimeout(() => transcribe(uri), 250);
+          if (Platform.OS !== 'web') setTimeout(() => transcribe(uri), 250);
         }
       } else {
         const permission = await requestRecordingPermissionsAsync();
         if (!permission.granted) { Alert.alert('Cần quyền micro', 'Cho phép dùng micro để ghi âm ghi chú.'); return; }
         await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
         await recorder.prepareToRecordAsync(); recorder.record();
+        if (Platform.OS === 'web') startBrowserTranscription();
       }
     } catch { Alert.alert('Chưa ghi âm được', 'Kiểm tra quyền micro rồi thử lại nhé.'); }
   }
+  function startBrowserTranscription() {
+    const SpeechRecognition = (window as SpeechWindow).SpeechRecognition || (window as SpeechWindow).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      Alert.alert('Trình duyệt chưa hỗ trợ chuyển giọng nói', 'Hãy mở app bằng Safari trên iPhone hoặc Chrome trên máy tính. Bản ghi âm vẫn được lưu.');
+      return;
+    }
+    try {
+      const recognition = new SpeechRecognition();
+      recognition.lang = 'vi-VN'; recognition.continuous = true; recognition.interimResults = true;
+      recognition.onresult = (event) => {
+        let finalText = transcriptRef.current;
+        let interimText = '';
+        for (let index = 0; index < event.results.length; index += 1) {
+          const result = event.results[index];
+          const value = result?.[0]?.transcript?.trim();
+          if (!value) continue;
+          if (result.isFinal) finalText = [finalText, value].filter(Boolean).join(' ');
+          else interimText = [interimText, value].filter(Boolean).join(' ');
+        }
+        transcriptRef.current = finalText;
+        partialRef.current = interimText;
+        const spokenText = [finalText, interimText].filter(Boolean).join(' ');
+        setTranscript(spokenText);
+        setDraft((current) => ({ ...current, body: [contentBeforeTranscriptRef.current, spokenText].filter(Boolean).join('\n') }));
+      };
+      recognition.onerror = (event) => {
+        setTranscribing(false);
+        if (event.error !== 'aborted' && event.error !== 'no-speech') Alert.alert('Chưa chuyển được thành chữ', 'Kiểm tra quyền micro và kết nối mạng, rồi thử ghi âm lại nhé.');
+      };
+      recognition.onend = () => {
+        if (shouldRecognizeRef.current) {
+          window.setTimeout(() => { try { recognition.start(); } catch { /* A recognition session may still be winding down. */ } }, 250);
+        } else setTranscribing(false);
+      };
+      browserRecognitionRef.current = recognition;
+      shouldRecognizeRef.current = true;
+      contentBeforeTranscriptRef.current = draft.body.trim();
+      transcriptRef.current = ''; partialRef.current = ''; setTranscript(''); setTranscribing(true);
+      recognition.start();
+    } catch {
+      shouldRecognizeRef.current = false;
+      setTranscribing(false);
+      Alert.alert('Chưa bật được nhận dạng giọng nói', 'Kiểm tra quyền micro của Safari rồi thử lại nhé.');
+    }
+  }
   async function transcribe(sourceUri = audioUri) {
     if (!sourceUri) return;
+    if (Platform.OS === 'web') {
+      Alert.alert('Chuyển lời nói thành chữ', 'Trên iPhone, lời nói được chuyển thành chữ ngay trong lúc ghi âm. Hãy ghi âm mới để tạo văn bản.');
+      return;
+    }
     try {
       const permission = await ExpoSpeechRecognitionModule.requestPermissionsAsync();
       if (!permission.granted) { Alert.alert('Cần quyền nhận dạng giọng nói', 'Cho phép quyền này để tạo văn bản từ bản ghi.'); return; }
@@ -324,7 +390,7 @@ export default function HomeScreen() {
                 {!!draft.imageUris.length && <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 9, paddingVertical: 10 }}>{draft.imageUris.map((uri) => <View key={uri} style={{ position: 'relative' }}><Image source={{ uri }} style={s.preview} /><Pressable onPress={() => setDraft((current) => ({ ...current, imageUris: current.imageUris.filter((value) => value !== uri) }))} style={s.removePhoto}><Text style={{ color: '#FFFFFF', fontWeight: '600' }}>×</Text></Pressable></View>)}</ScrollView>}
               </>}
               <Text style={[s.label, { color: colors.ink }]}>{transcribing ? 'Đang chuyển giọng nói thành chữ…' : recorderState.isRecording ? 'Đang ghi âm · chạm nút để dừng' : 'Ghi âm giọng nói'}</Text><View style={[s.pills, { alignItems: 'center' }]}><Button label={recorderState.isRecording ? 'Dừng ghi' : 'Bắt đầu ghi'} primary={recorderState.isRecording} palette={colors} onPress={record} />{audioUri && <Text style={{ color: colors.green, fontSize: 10 }}>✓ Đã lưu bản ghi</Text>}</View>
-              {!!audioUri && <View style={s.pills}><AudioPlayback uri={audioUri} palette={colors} /><Button label={transcribing ? 'Đang chuyển thành chữ…' : 'A  Chuyển thành văn bản'} palette={colors} onPress={transcribe} /></View>}
+              {!!audioUri && <View style={s.pills}><AudioPlayback uri={audioUri} palette={colors} />{Platform.OS !== 'web' && <Button label={transcribing ? 'Đang chuyển thành chữ…' : 'A  Chuyển thành văn bản'} palette={colors} onPress={transcribe} />}</View>}
               <View style={s.actions}>{editing && <Pressable onPress={removeEntry} style={[s.delete, { borderColor: colors.line }]}><Text style={{ color: colors.primaryDark }}>Xóa mục</Text></Pressable>}<View style={{ flex: 1 }} /><Pressable onPress={() => setVisible(false)} style={[s.cancel, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink }}>Để sau</Text></Pressable><Pressable onPress={save} style={[s.save, { backgroundColor: colors.primary }]}><Text style={{ color: '#FFFFFF', fontWeight: '600' }}>Lưu lại ✿</Text></Pressable></View>
             </ScrollView>
           </View>
