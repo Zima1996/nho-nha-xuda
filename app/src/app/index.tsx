@@ -237,7 +237,7 @@ export default function HomeScreen() {
       recognition.onresult = (event) => {
         let finalText = transcriptRef.current;
         let interimText = '';
-        for (let index = 0; index < event.results.length; index += 1) {
+        for (let index = event.resultIndex; index < event.results.length; index += 1) {
           const result = event.results[index];
           const value = result?.[0]?.transcript?.trim();
           if (!value) continue;
