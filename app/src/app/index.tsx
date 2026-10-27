@@ -324,7 +324,8 @@ export default function HomeScreen() {
             {list.length ? <View style={tablet ? s.grid : undefined}>{list.map((item) => <EntryRow key={item.id} item={item} palette={colors} petIcon={petFor(item.id, petSeed)} compact={tablet} onOpen={() => begin(item.kind, item)} onToggle={() => put({ ...item, status: item.status === 'done' ? 'todo' : 'done' })} />)}</View> : <View style={[s.empty, { backgroundColor: colors.surface, borderColor: colors.line }]}><Image source={petFor('empty-today', petSeed)} style={s.emptyPet} /><Text style={[s.sectionTitle, { color: colors.ink }]}>Chưa có gì ở đây</Text><Text style={[s.subtitle, { color: colors.muted }]}>{copy.empty}</Text><Button label="＋ Ghi nhanh" primary palette={colors} onPress={() => begin()} /></View>}
           </>}
           {tab === 'notes' && <>
-            <Text style={[s.eyebrow, { color: colors.muted }]}>GÓC LƯU GIỮ</Text><Text style={[s.title, { color: colors.ink }]}>Những điều mình cất lại <Text style={{ color: colors.primary }}>✎</Text></Text><Text style={[s.subtitle, { color: colors.muted, marginBottom: 15 }]}>{copy.notes}</Text>
+            <View style={s.sectionTop}><Text style={[s.sectionTitle, { color: colors.ink }]}>Ghi chú</Text><QuickActions palette={colors} recording={recorderState.isRecording} onRecord={async () => { if (recorderState.isRecording) { await record(); return; } setTab('today'); begin('note'); setTimeout(async () => { await record(); }, 350); }} onAdd={() => begin('note')} addLabel="Ghi nhanh" /></View>
+            <Text style={[s.title, { color: colors.ink }]}>Những điều mình cất lại <Text style={{ color: colors.primary }}>✎</Text></Text><Text style={[s.subtitle, { color: colors.muted, marginBottom: 15 }]}>{copy.notes}</Text>
             <Search value={query} onChange={setQuery} palette={colors} />
             <View style={[s.noteGrid, { gap: 10 }]}>{list.map((item, index) => <Pressable key={item.id} onPress={() => begin('note', item)} style={[s.note, { backgroundColor: index % 2 ? colors.surfaceAlt : colors.surface, borderColor: colors.line, width: tablet ? '31.5%' : '48%', transform: [{ rotate: index % 2 ? '0.5deg' : '-0.5deg' }] }]}>
               {item.imageUris[0] ? <Image source={{ uri: item.imageUris[0] }} style={s.photo} /> : <View style={[s.photo, s.photoPlaceholder, { backgroundColor: colors.surfaceAlt }]}><Image source={petFor(item.id, petSeed)} style={s.placeholderPet} /></View>}
@@ -335,7 +336,8 @@ export default function HomeScreen() {
             {!list.length && <Empty palette={colors} emoji="📔" petIcon={petFor('empty-notes', petSeed)} title="Sổ còn đang chờ bạn" label="＋ Tạo Note" onPress={() => begin('note')} />}
           </>}
           {tab === 'calendar' && <>
-            <Text style={[s.eyebrow, { color: colors.muted }]}>LỊCH CỦA MÌNH</Text><Text style={[s.title, { color: colors.ink }]}>Nhìn trước một chút <Text style={{ color: colors.primary }}>☁</Text></Text><Text style={[s.subtitle, { color: colors.muted }]}>Các sự kiện và việc có giờ hẹn.</Text>
+            <View style={s.sectionTop}><Text style={[s.sectionTitle, { color: colors.ink }]}>Lịch</Text><QuickActions palette={colors} recording={recorderState.isRecording} onRecord={async () => { if (recorderState.isRecording) { await record(); return; } setTab('today'); begin('note'); setTimeout(async () => { await record(); }, 350); }} onAdd={() => begin('task')} addLabel="Ghi nhanh" /></View>
+            <Text style={[s.title, { color: colors.ink }]}>Nhìn trước một chút <Text style={{ color: colors.primary }}>☁</Text></Text><Text style={[s.subtitle, { color: colors.muted }]}>Các sự kiện và việc có giờ hẹn.</Text>
             <View style={[s.calendarBanner, { backgroundColor: colors.surfaceAlt }]}><Text style={{ fontSize: 26 }}>🗓️</Text><View><Text style={[s.progressTitle, { color: colors.ink }]}>Hôm nay</Text><Text style={[s.progressCaption, { color: colors.muted }]}>Sự kiện và việc có giờ hẹn.</Text></View></View>
             {list.map((item) => <EntryRow key={item.id} item={item} palette={colors} petIcon={petFor(item.id, petSeed)} onOpen={() => begin(item.kind, item)} onToggle={() => put({ ...item, status: item.status === 'done' ? 'todo' : 'done' })} />)}
             {!list.length && <Empty palette={colors} emoji="☕" petIcon={petFor('empty-calendar', petSeed)} title="Lịch đang thoáng" label="＋ Ghi nhanh" onPress={() => begin('task')} />}
@@ -364,7 +366,6 @@ export default function HomeScreen() {
           </>}
         </ScrollView>
 
-        {tab !== 'settings' && tab !== 'today' && <View style={s.fabGroup}><QuickActions palette={colors} recording={recorderState.isRecording} onRecord={async () => { if (recorderState.isRecording) { await record(); return; } setTab('today'); begin('note'); setTimeout(async () => { await record(); }, 350); }} onAdd={() => begin(tab === 'notes' ? 'note' : 'task')} addLabel={tab === 'notes' ? 'Thêm Note' : 'Ghi nhanh'} /></View>}
         <View style={[s.nav, { backgroundColor: colors.surface, borderColor: colors.line }]}>
           {([['today', 'home', 'Hôm nay'], ['notes', 'notes', 'Ghi chú'], ['calendar', 'calendar', 'Lịch'], ['settings', 'settings', 'Setting']] as [Tab, NavGlyphKind, string][]).map(([page, icon, label]) => <Pressable key={page} onPress={() => { setTab(page); setQuery(''); }} style={s.navItem}><NavGlyph kind={icon} color={tab === page ? colors.primaryDark : colors.muted} active={tab === page} palette={colors} /><Text style={[s.navLabel, { color: tab === page ? colors.primaryDark : colors.muted }]}>{label}</Text></Pressable>)}
         </View>
