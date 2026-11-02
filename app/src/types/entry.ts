@@ -19,6 +19,7 @@ export type Entry = {
   audioUri?: string;
   transcript?: string;
   googleEventId?: string;
+  dayKey?: string;
   createdAt: string;
 };
-export type AppData = { entries: Entry[]; theme: ThemeName; googleEmail?: string; googleLastSyncedAt?: string };
+export type AppData = { entries: Entry[]; theme: ThemeName; todayKey?: string; googleEmail?: string; googleLastSyncedAt?: string };

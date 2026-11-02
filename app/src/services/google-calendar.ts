@@ -151,7 +151,7 @@ export async function syncGoogleCalendar(token: string, entries: Entry[]): Promi
 
   let uploaded = 0;
   for (const entry of nextEntries) {
-    if (entry.kind === 'note' || !entry.dueAt) continue;
+    if (entry.kind !== 'event' || !entry.dueAt) continue;
     const eventBody = toGoogleEvent(entry);
     if (entry.googleEventId) {
       await googleFetch<GoogleEvent>(token, `/calendars/primary/events/${encodeURIComponent(entry.googleEventId)}`, {

@@ -12,11 +12,13 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { entryColorOptions, palettes } from '@/constants/palettes';
 import { AudioPlayback } from '@/components/AudioPlayback';
-import { loadAppData, saveAppData, starterData } from '@/data/local-store';
+import { loadAppData, localDayKey, rollOverDailyItems, saveAppData, starterData } from '@/data/local-store';
 import { getGoogleAccountEmail, requestGoogleAccessToken, syncGoogleCalendar } from '@/services/google-calendar';
 import type { AppData, Entry, EntryKind, ThemeName } from '@/types/entry';
 
-type Tab = 'today' | 'notes' | 'calendar' | 'settings';
+type Tab = 'today' | 'calendar' | 'settings';
+type CalendarSection = 'events' | 'notes';
+type ComposerMode = 'task' | 'note' | 'voice';
 type Draft = Omit<Entry, 'id' | 'createdAt'>;
 type BrowserSpeechResult = { transcript: string };
 type BrowserSpeechEvent = Event & { resultIndex: number; results: ArrayLike<ArrayLike<BrowserSpeechResult> & { isFinal: boolean }> };
@@ -76,8 +78,11 @@ function persistMedia(uri: string, extension: string) {
 export default function HomeScreen() {
   const { width } = useWindowDimensions();
   const [tab, setTab] = useState<Tab>('today');
+  const [calendarSection, setCalendarSection] = useState<CalendarSection>('events');
   const [data, setData] = useState<AppData>(starterData);
   const [ready, setReady] = useState(false);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [clock, setClock] = useState(() => new Date());
   const [googleAccessToken, setGoogleAccessToken] = useState<string>();
   const [googleBusy, setGoogleBusy] = useState(false);
   const [petSeed, setPetSeed] = useState(0);
@@ -85,6 +90,7 @@ export default function HomeScreen() {
   const [query, setQuery] = useState('');
   const [editing, setEditing] = useState<string | null>(null);
   const [visible, setVisible] = useState(false);
+  const [composerMode, setComposerMode] = useState<ComposerMode>('task');
   const [draft, setDraft] = useState<Draft>(newDraft());
   const [audioUri, setAudioUri] = useState<string>();
   const [transcript, setTranscript] = useState('');
@@ -94,6 +100,10 @@ export default function HomeScreen() {
   const contentBeforeTranscriptRef = useRef('');
   const browserRecognitionRef = useRef<BrowserSpeechRecognition | null>(null);
   const shouldRecognizeRef = useRef(false);
+  const autoSaveVoiceRef = useRef(false);
+  const pendingVoiceAudioRef = useRef<string | undefined>(undefined);
+  const browserRecognitionEndRef = useRef<(() => void) | null>(null);
+  const finishVoiceNoteRef = useRef<(() => void) | null>(null);
   const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
   const recorderState = useAudioRecorderState(recorder);
   const tablet = width >= 760;
@@ -115,33 +125,61 @@ export default function HomeScreen() {
     setTranscript(spokenText);
     setDraft((current) => ({ ...current, body: [contentBeforeTranscriptRef.current, spokenText].filter(Boolean).join('\n') }));
   });
-  useSpeechRecognitionEvent('end', () => setTranscribing(false));
   useSpeechRecognitionEvent('error', (event) => {
     setTranscribing(false);
     if (event.error !== 'aborted') Alert.alert('Chưa chuyển được thành chữ', 'Bạn có thể thử lại hoặc giữ nguyên bản ghi âm.');
   });
+  useSpeechRecognitionEvent('end', () => {
+    setTranscribing(false);
+    if (autoSaveVoiceRef.current) finishVoiceNoteRef.current?.();
+  });
 
   useEffect(() => {
-    loadAppData().then((saved) => { setData(saved); setReady(true); }).catch(() => setReady(true));
+    loadAppData().then((saved) => { setData(saved); setReady(true); }).catch((error) => {
+      console.warn('Could not load saved app data; keeping it untouched', error);
+      setLoadFailed(true);
+      setReady(true);
+    });
   }, []);
   useEffect(() => {
-    if (ready) saveAppData(data).catch((error) => console.warn('Local save failed', error));
-  }, [data, ready]);
+    if (ready && !loadFailed) saveAppData(data).catch((error) => console.warn('Local save failed', error));
+  }, [data, ready, loadFailed]);
+  useEffect(() => {
+    const timer = setInterval(() => setClock(new Date()), 30_000);
+    return () => clearInterval(timer);
+  }, []);
+  const todayKey = localDayKey(clock);
+  useEffect(() => {
+    if (!ready || loadFailed || data.todayKey === todayKey) return;
+    const nextData = rollOverDailyItems(data, todayKey);
+    const retainedNotifications = new Set(nextData.entries.map((entry) => entry.notificationId).filter(Boolean));
+    const timer = setTimeout(() => {
+      data.entries.filter((entry) => entry.notificationId && !retainedNotifications.has(entry.notificationId))
+        .forEach((entry) => Notifications.cancelScheduledNotificationAsync(entry.notificationId!).catch(() => undefined));
+      setData((current) => current.todayKey === todayKey ? current : rollOverDailyItems(current, todayKey));
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [data, ready, todayKey, loadFailed]);
+  const greeting = clock.getHours() >= 5 && clock.getHours() < 12
+    ? 'Chào buổi sáng, Xuda'
+    : clock.getHours() >= 12 && clock.getHours() < 18
+      ? 'Chào buổi chiều, Xuda'
+      : 'Chào buổi tối, Xuda';
 
   const list = useMemo(() => {
     let result = data.entries;
-    if (tab === 'today') result = result.filter((item) => item.kind !== 'note');
-    if (tab === 'notes') result = result.filter((item) => item.kind === 'note');
-    if (tab === 'calendar') result = result.filter((item) => item.kind === 'event' || item.kind === 'routine' || !!item.dueAt);
+    if (tab === 'today') result = result.filter((item) => (item.kind === 'task' || item.kind === 'routine') && (!item.dayKey || item.dayKey <= todayKey));
+    if (tab === 'calendar') result = result.filter((item) => calendarSection === 'events' ? item.kind === 'event' : item.kind === 'note');
     if (query.trim()) {
       const needle = query.trim().toLocaleLowerCase('vi');
       result = result.filter((item) => (item.title + ' ' + item.body + ' ' + (item.transcript || '')).toLocaleLowerCase('vi').includes(needle));
     }
     return [...result].sort((a, b) => (a.dueAt || a.createdAt).localeCompare(b.dueAt || b.createdAt));
-  }, [data.entries, tab, query]);
+  }, [data.entries, tab, calendarSection, query, todayKey]);
 
-  function begin(kindValue: EntryKind = 'task', item?: Entry) {
+  function begin(kindValue: EntryKind = 'task', item?: Entry, mode?: ComposerMode) {
     setEditing(item?.id || null);
+    setComposerMode(mode || (kindValue === 'note' ? 'note' : 'task'));
     if (item) {
       const { id: _id, createdAt: _created, ...rest } = item;
       setDraft({ ...rest, imageUris: [...item.imageUris] });
@@ -153,6 +191,16 @@ export default function HomeScreen() {
     transcriptRef.current = item?.transcript || '';
     setVisible(true);
   }
+  function beginVoiceNote() {
+    autoSaveVoiceRef.current = true;
+    pendingVoiceAudioRef.current = undefined;
+    begin('note', undefined, 'voice');
+  }
+  function beginQuickNote(item?: Entry) {
+    autoSaveVoiceRef.current = false;
+    pendingVoiceAudioRef.current = undefined;
+    begin('note', item, 'note');
+  }
   function put(item: Entry) {
     setData((current) => ({
       ...current,
@@ -161,6 +209,29 @@ export default function HomeScreen() {
         : [item, ...current.entries],
     }));
   }
+  function finishVoiceNote() {
+    const audio = pendingVoiceAudioRef.current;
+    if (!audio || !autoSaveVoiceRef.current) return;
+    const body = draft.body.trim() || transcriptRef.current.trim();
+    const now = new Date();
+    const title = body.split('\n')[0]?.trim().slice(0, 54) || `Bản ghi âm · ${when(now.toISOString())}`;
+    const item: Entry = {
+      ...newDraft('note'),
+      id: id(),
+      title,
+      body,
+      transcript: body,
+      audioUri: audio,
+      createdAt: now.toISOString(),
+    };
+    put(item);
+    autoSaveVoiceRef.current = false;
+    pendingVoiceAudioRef.current = undefined;
+    setVisible(false);
+    setTranscribing(false);
+    Alert.alert('Đã lưu ghi âm', 'Bản ghi và phần chữ đã được lưu trong Ghi chú ở tab Lịch.');
+  }
+  finishVoiceNoteRef.current = finishVoiceNote;
   async function connectGoogle() {
     const clientId = process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID;
     if (!clientId) {
@@ -193,7 +264,7 @@ export default function HomeScreen() {
       const syncedAt = new Date().toISOString();
       setGoogleAccessToken(token);
       setData((current) => ({ ...current, entries: result.entries, googleEmail: email || current.googleEmail, googleLastSyncedAt: syncedAt }));
-      Alert.alert('Đã đồng bộ lịch', `Đã nhập ${result.imported} sự kiện và thêm ${result.uploaded} việc lên Google Calendar.`);
+      Alert.alert('Đã đồng bộ lịch', `Đã nhập ${result.imported} sự kiện và thêm ${result.uploaded} sự kiện lên Google Calendar.`);
     } catch (error) {
       Alert.alert('Chưa đồng bộ được', error instanceof Error ? error.message : 'Hãy kiểm tra kết nối rồi thử lại nhé.');
     } finally { setGoogleBusy(false); }
@@ -213,15 +284,19 @@ export default function HomeScreen() {
     });
   }
   async function save() {
-    const title = draft.title.trim() || draft.body.trim().split('\n')[0].slice(0, 54) || transcript.trim().split('\n')[0].slice(0, 54) || (audioUri ? 'Bản ghi âm mới' : '');
-    if (!title) { Alert.alert('Thêm một chút nội dung nhé', 'Nhập tiêu đề hoặc ghi chú trước khi lưu.'); return; }
     const previous = data.entries.find((entry) => entry.id === editing);
+    const noteContent = draft.body.trim();
+    const title = draft.kind === 'note'
+      ? previous?.title || noteContent.split('\n')[0]?.slice(0, 54) || (draft.imageUris.length ? `Ghi chú · ${when(new Date().toISOString())}` : '')
+      : draft.title.trim() || noteContent.split('\n')[0]?.slice(0, 54) || transcript.trim().split('\n')[0]?.slice(0, 54) || (audioUri ? 'Bản ghi âm mới' : '');
+    if (!title) { Alert.alert('Thêm một chút nội dung nhé', 'Viết ghi chú hoặc thêm ảnh trước khi lưu.'); return; }
     if (previous?.notificationId && (!draft.reminderAt || draft.reminderAt !== previous.reminderAt)) {
       Notifications.cancelScheduledNotificationAsync(previous.notificationId).catch(() => undefined);
     }
     const item: Entry = {
       ...draft, title, id: editing || id(), createdAt: previous?.createdAt || new Date().toISOString(),
       audioUri: audioUri || draft.audioUri, transcript: transcript || draft.transcript,
+      ...((draft.kind === 'task' || draft.kind === 'routine') ? { dayKey: previous?.dayKey || todayKey } : {}),
     };
     if (item.reminderAt && (!previous || item.reminderAt !== previous.reminderAt)) {
       try { item.notificationId = await setReminder(item); }
@@ -246,15 +321,46 @@ export default function HomeScreen() {
       }
     } catch { Alert.alert('Chưa thêm được ảnh', 'Thử chụp ảnh hoặc chọn lại từ thư viện nhé.'); }
   }
+  async function stopBrowserTranscription() {
+    const recognition = browserRecognitionRef.current;
+    if (!recognition || !shouldRecognizeRef.current) return;
+    shouldRecognizeRef.current = false;
+    await new Promise<void>((resolve) => {
+      let finished = false;
+      const complete = () => {
+        if (finished) return;
+        finished = true;
+        window.clearTimeout(timeout);
+        browserRecognitionEndRef.current = null;
+        resolve();
+      };
+      const timeout = window.setTimeout(complete, 1600);
+      browserRecognitionEndRef.current = complete;
+      try { recognition.stop(); } catch { complete(); }
+    });
+  }
+  async function closeComposer() {
+    if (recorderState.isRecording) {
+      await record();
+      return;
+    }
+    autoSaveVoiceRef.current = false;
+    pendingVoiceAudioRef.current = undefined;
+    setVisible(false);
+  }
   async function record() {
     try {
       if (recorderState.isRecording) {
-        if (Platform.OS === 'web') { shouldRecognizeRef.current = false; browserRecognitionRef.current?.stop(); }
+        if (Platform.OS === 'web') await stopBrowserTranscription();
         await recorder.stop();
         if (recorder.uri) {
           const uri = persistMedia(recorder.uri, '.m4a');
           setAudioUri(uri); setDraft((value) => ({ ...value, audioUri: uri }));
-          if (Platform.OS !== 'web') setTimeout(() => transcribe(uri), 250);
+          if (composerMode === 'voice') {
+            pendingVoiceAudioRef.current = uri;
+            if (Platform.OS === 'web') finishVoiceNoteRef.current?.();
+            else transcribe(uri);
+          }
         }
       } else {
         const permission = await requestRecordingPermissionsAsync();
@@ -297,7 +403,10 @@ export default function HomeScreen() {
       recognition.onend = () => {
         if (shouldRecognizeRef.current) {
           window.setTimeout(() => { try { recognition.start(); } catch { /* A recognition session may still be winding down. */ } }, 250);
-        } else setTranscribing(false);
+        } else {
+          setTranscribing(false);
+          browserRecognitionEndRef.current?.();
+        }
       };
       browserRecognitionRef.current = recognition;
       shouldRecognizeRef.current = true;
@@ -318,7 +427,11 @@ export default function HomeScreen() {
     }
     try {
       const permission = await ExpoSpeechRecognitionModule.requestPermissionsAsync();
-      if (!permission.granted) { Alert.alert('Cần quyền nhận dạng giọng nói', 'Cho phép quyền này để tạo văn bản từ bản ghi.'); return; }
+      if (!permission.granted) {
+        Alert.alert('Chưa có quyền nhận dạng giọng nói', 'Bản ghi âm vẫn được lưu; bạn có thể bật quyền nhận dạng giọng nói trong Cài đặt.');
+        if (autoSaveVoiceRef.current) finishVoiceNoteRef.current?.();
+        return;
+      }
       contentBeforeTranscriptRef.current = transcript && draft.body.endsWith(transcript)
         ? draft.body.slice(0, -transcript.length).trim()
         : draft.body.trim();
@@ -330,10 +443,14 @@ export default function HomeScreen() {
         requiresOnDeviceRecognition: Platform.OS === 'ios',
         audioSource: { uri: sourceUri, audioChannels: 1, sampleRate: 16000 },
       });
-    } catch { setTranscribing(false); Alert.alert('Chưa chuyển được thành chữ', 'Thiết bị có thể chưa hỗ trợ nhận dạng tiếng Việt cho bản ghi này.'); }
+    } catch {
+      setTranscribing(false);
+      Alert.alert('Chưa chuyển được thành chữ', 'Bản ghi âm vẫn được giữ lại để bạn nghe sau.');
+      if (autoSaveVoiceRef.current) finishVoiceNoteRef.current?.();
+    }
   }
-  const total = data.entries.filter((entry) => entry.kind !== 'note').length;
-  const done = data.entries.filter((entry) => entry.kind !== 'note' && entry.status === 'done').length;
+  const total = data.entries.filter((entry) => (entry.kind === 'task' || entry.kind === 'routine') && (!entry.dayKey || entry.dayKey <= todayKey)).length;
+  const done = data.entries.filter((entry) => (entry.kind === 'task' || entry.kind === 'routine') && (!entry.dayKey || entry.dayKey <= todayKey) && entry.status === 'done').length;
   const mainWidth = tablet ? 930 : 600;
 
 
@@ -349,7 +466,7 @@ export default function HomeScreen() {
           {tab === 'today' && <>
             <View style={s.hero}>
               <View style={{ flex: 1 }}>
-                <Text style={[s.title, { color: colors.ink }]}>Chào buổi sáng, Xuda <Text style={{ color: colors.primary }}>✿</Text></Text>
+                <Text style={[s.title, { color: colors.ink }]}>{greeting} <Text style={{ color: colors.primary }}>✿</Text></Text>
               </View>
             </View>
             <View style={[s.progress, { backgroundColor: colors.surface, borderColor: colors.line }]}>
@@ -358,30 +475,34 @@ export default function HomeScreen() {
                 <Text style={[s.progressNumber, { color: colors.primary }]}>{total ? Math.round(done / total * 100) : 0}%</Text></View>
               <View style={[s.progressTrack, { backgroundColor: colors.line }]}><View style={[s.progressFill, { width: `${total ? Math.round(done / total * 100) : 0}%`, backgroundColor: colors.primary }]} /></View>
             </View>
-            <View style={s.sectionTop}><Text style={[s.sectionTitle, { color: colors.ink }]}>Việc cần nhớ</Text><QuickActions palette={colors} recording={recorderState.isRecording} onRecord={async () => { if (recorderState.isRecording) { await record(); return; } begin('note'); setTimeout(async () => { await record(); }, 350); }} onAdd={() => begin('task')} addLabel="Ghi nhanh" /></View>
+            <View style={s.sectionTop}><Text style={[s.sectionTitle, { color: colors.ink }]}>Việc cần nhớ</Text><QuickActions palette={colors} onRecord={beginVoiceNote} onAdd={() => beginQuickNote()} addLabel="Ghi chú" /></View>
             <Search value={query} onChange={setQuery} palette={colors} />
             <View style={s.listHead}><Text style={[s.dayLabel, { color: colors.muted }]}>HÔM NAY · {list.length} MỤC</Text><Text style={[s.handText, { color: colors.primaryDark }]}>{copy.nudge}</Text></View>
-            {list.length ? <View style={tablet ? s.grid : undefined}>{list.map((item) => <EntryRow key={item.id} item={item} palette={colors} petIcon={petFor(item.id, petSeed)} compact={tablet} onOpen={() => begin(item.kind, item)} onToggle={() => put({ ...item, status: item.status === 'done' ? 'todo' : 'done' })} />)}</View> : <View style={[s.empty, { backgroundColor: colors.surface, borderColor: colors.line }]}><Image source={petFor('empty-today', petSeed)} style={s.emptyPet} /><Text style={[s.sectionTitle, { color: colors.ink }]}>Chưa có gì ở đây</Text><Text style={[s.subtitle, { color: colors.muted }]}>{copy.empty}</Text><Button label="＋ Ghi nhanh" primary palette={colors} onPress={() => begin()} /></View>}
-          </>}
-          {tab === 'notes' && <>
-            <View style={s.sectionTop}><Text style={[s.sectionTitle, { color: colors.ink }]}>Ghi chú</Text><QuickActions palette={colors} recording={recorderState.isRecording} onRecord={async () => { if (recorderState.isRecording) { await record(); return; } setTab('today'); begin('note'); setTimeout(async () => { await record(); }, 350); }} onAdd={() => begin('note')} addLabel="Ghi nhanh" /></View>
-            <Text style={[s.title, { color: colors.ink }]}>Những điều mình cất lại <Text style={{ color: colors.primary }}>✎</Text></Text><Text style={[s.subtitle, { color: colors.muted, marginBottom: 15 }]}>{copy.notes}</Text>
-            <Search value={query} onChange={setQuery} palette={colors} />
-            <View style={[s.noteGrid, { gap: 10 }]}>{list.map((item, index) => <Pressable key={item.id} onPress={() => begin('note', item)} style={[s.note, { backgroundColor: index % 2 ? colors.surfaceAlt : colors.surface, borderColor: colors.line, width: tablet ? '31.5%' : '48%', transform: [{ rotate: index % 2 ? '0.5deg' : '-0.5deg' }] }]}>
-              {item.imageUris[0] ? <Image source={{ uri: item.imageUris[0] }} style={s.photo} /> : <View style={[s.photo, s.photoPlaceholder, { backgroundColor: colors.surfaceAlt }]}><Image source={petFor(item.id, petSeed)} style={s.placeholderPet} /></View>}
-              <Text style={[s.noteTitle, { color: colors.ink }]} numberOfLines={2}>{item.title}</Text>
-              {!!item.body && <Text style={[s.noteBody, { color: colors.muted }]} numberOfLines={4}>{item.body}</Text>}
-              {!!item.imageUris.length && <Text style={[s.noteDate, { color: colors.primaryDark }]}>{item.imageUris.length} ảnh</Text>}
-            </Pressable>)}</View>
-            {!list.length && <Empty palette={colors} emoji="📔" petIcon={petFor('empty-notes', petSeed)} title="Sổ còn đang chờ bạn" label="＋ Tạo Note" onPress={() => begin('note')} />}
+            {list.length ? <View style={tablet ? s.grid : undefined}>{list.map((item) => <EntryRow key={item.id} item={item} palette={colors} petIcon={petFor(item.id, petSeed)} compact={tablet} onOpen={() => begin(item.kind, item)} onToggle={() => put({ ...item, status: item.status === 'done' ? 'todo' : 'done' })} />)}</View> : <View style={[s.empty, { backgroundColor: colors.surface, borderColor: colors.line }]}><Image source={petFor('empty-today', petSeed)} style={s.emptyPet} /><Text style={[s.sectionTitle, { color: colors.ink }]}>Chưa có gì ở đây</Text><Text style={[s.subtitle, { color: colors.muted }]}>{copy.empty}</Text><Button label="＋ Ghi chú" primary palette={colors} onPress={() => beginQuickNote()} /></View>}
           </>}
           {tab === 'calendar' && <>
-            <View style={s.sectionTop}><Text style={[s.sectionTitle, { color: colors.ink }]}>Lịch</Text><QuickActions palette={colors} recording={recorderState.isRecording} onRecord={async () => { if (recorderState.isRecording) { await record(); return; } setTab('today'); begin('note'); setTimeout(async () => { await record(); }, 350); }} onAdd={() => begin('task')} addLabel="Ghi nhanh" /></View>
-            <Text style={[s.title, { color: colors.ink }]}>Nhìn trước một chút <Text style={{ color: colors.primary }}>☁</Text></Text><Text style={[s.subtitle, { color: colors.muted }]}>Các sự kiện và việc có giờ hẹn.</Text>
-            <View style={[s.calendarBanner, { backgroundColor: colors.surfaceAlt }]}><Text style={{ fontSize: 26 }}>🗓️</Text><View><Text style={[s.progressTitle, { color: colors.ink }]}>Hôm nay</Text><Text style={[s.progressCaption, { color: colors.muted }]}>Sự kiện và việc có giờ hẹn.</Text></View></View>
-            {list.map((item) => <EntryRow key={item.id} item={item} palette={colors} petIcon={petFor(item.id, petSeed)} onOpen={() => begin(item.kind, item)} onToggle={() => put({ ...item, status: item.status === 'done' ? 'todo' : 'done' })} />)}
-            {!list.length && <Empty palette={colors} emoji="☕" petIcon={petFor('empty-calendar', petSeed)} title="Lịch đang thoáng" label="＋ Ghi nhanh" onPress={() => begin('task')} />}
-            <Pressable onPress={() => setTab('settings')} style={[s.integration, { borderColor: colors.line, backgroundColor: colors.surface }]}><Text style={{ fontSize: 22 }}>🌐</Text><View style={{ flex: 1 }}><Text style={[s.integrationTitle, { color: colors.ink }]}>Google Calendar</Text><Text style={[s.integrationSub, { color: colors.muted }]}>{data.googleEmail ? `Đã kết nối · ${data.googleEmail}` : 'Chạm để đăng nhập trong Cài đặt.'}</Text></View><Text style={{ color: colors.primary, fontSize: 21 }}>{data.googleEmail ? '✓' : '›'}</Text></Pressable>
+            <View style={s.sectionTop}><Text style={[s.sectionTitle, { color: colors.ink }]}>Lịch</Text><QuickActions palette={colors} onRecord={beginVoiceNote} onAdd={() => beginQuickNote()} addLabel="Ghi chú" /></View>
+            <Text style={[s.title, { color: colors.ink }]}>{calendarSection === 'events' ? 'Sự kiện sắp tới' : 'Ghi chú đã lưu'} <Text style={{ color: colors.primary }}>{calendarSection === 'events' ? '☁' : '✎'}</Text></Text>
+            <Text style={[s.subtitle, { color: colors.muted }]}>{calendarSection === 'events' ? 'Các sự kiện dài hạn từ app và Google Calendar.' : 'Ảnh, chữ và bản ghi âm được giữ lại lâu dài.'}</Text>
+            <View style={[s.calendarTabs, { backgroundColor: colors.surfaceAlt }]}>
+              {([['events', 'Sự kiện'], ['notes', 'Ghi chú']] as [CalendarSection, string][]).map(([section, label]) => <Pressable key={section} onPress={() => { setCalendarSection(section); setQuery(''); }} style={[s.calendarTab, { backgroundColor: calendarSection === section ? colors.surface : 'transparent', borderColor: calendarSection === section ? colors.line : 'transparent' }]}><Text style={{ color: calendarSection === section ? colors.ink : colors.muted, fontWeight: '600', fontSize: 12 }}>{label}</Text></Pressable>)}
+            </View>
+            <Search value={query} onChange={setQuery} palette={colors} />
+            {calendarSection === 'events' ? <>
+              <Pressable onPress={syncCalendar} style={[s.integration, { borderColor: colors.line, backgroundColor: colors.surface }]}><Text style={{ fontSize: 22 }}>🗓️</Text><View style={{ flex: 1 }}><Text style={[s.integrationTitle, { color: colors.ink }]}>Google Calendar</Text><Text style={[s.integrationSub, { color: colors.muted }]}>{googleBusy ? 'Đang đồng bộ…' : data.googleEmail ? `Đã kết nối · ${data.googleEmail} · Chạm để đồng bộ` : 'Đăng nhập trong Setting để đồng bộ'}</Text></View><Text style={{ color: colors.primary, fontSize: 21 }}>{data.googleEmail ? '↻' : '›'}</Text></Pressable>
+              {list.map((item) => <EntryRow key={item.id} item={item} palette={colors} petIcon={petFor(item.id, petSeed)} onOpen={() => begin(item.kind, item)} onToggle={() => put({ ...item, status: item.status === 'done' ? 'todo' : 'done' })} />)}
+              {!list.length && <Empty palette={colors} emoji="☕" petIcon={petFor('empty-calendar', petSeed)} title="Chưa có sự kiện sắp tới" label="Đồng bộ Google Calendar" onPress={() => syncCalendar()} />}
+            </> : <>
+              <View style={[s.noteGrid, { gap: 10 }]}>{list.map((item, index) => <Pressable key={item.id} onPress={() => beginQuickNote(item)} style={[s.note, { backgroundColor: index % 2 ? colors.surfaceAlt : colors.surface, borderColor: colors.line, width: tablet ? '31.5%' : '48%', transform: [{ rotate: index % 2 ? '0.5deg' : '-0.5deg' }] }]}>
+                {item.imageUris[0] ? <Image source={{ uri: item.imageUris[0] }} style={s.photo} /> : <View style={[s.photo, s.photoPlaceholder, { backgroundColor: colors.surfaceAlt }]}><Image source={petFor(item.id, petSeed)} style={s.placeholderPet} /></View>}
+                <Text style={[s.noteTitle, { color: colors.ink }]} numberOfLines={2}>{item.title}</Text>
+                {!!item.body && <Text style={[s.noteBody, { color: colors.muted }]} numberOfLines={4}>{item.body}</Text>}
+                {!!item.imageUris.length && <Text style={[s.noteDate, { color: colors.primaryDark }]}>{item.imageUris.length} ảnh</Text>}
+                {item.audioUri && <View style={{ marginTop: 7 }}><AudioPlayback uri={item.audioUri} palette={colors} /></View>}
+                <Text style={[s.noteDate, { color: colors.muted }]}>{new Date(item.createdAt).toLocaleDateString('vi-VN')}</Text>
+              </Pressable>)}</View>
+              {!list.length && <Empty palette={colors} emoji="📔" petIcon={petFor('empty-notes', petSeed)} title="Chưa có ghi chú nào" label="＋ Ghi chú" onPress={() => beginQuickNote()} />}
+            </>}
           </>}
           {tab === 'settings' && <>
             <Text style={[s.eyebrow, { color: colors.muted }]}>GÓC CỦA BẠN</Text><Text style={[s.title, { color: colors.ink }]}>Cài đặt nhỏ xinh <Text style={{ color: colors.primary }}>⚙</Text></Text><Text style={[s.subtitle, { color: colors.muted, marginBottom: 22 }]}>Chọn cảm giác hợp với bạn.</Text>
@@ -405,32 +526,38 @@ export default function HomeScreen() {
         </ScrollView>
 
         <View style={[s.nav, { backgroundColor: colors.surface, borderColor: colors.line }]}>
-          {([['today', 'home', 'Hôm nay'], ['notes', 'notes', 'Ghi chú'], ['calendar', 'calendar', 'Lịch'], ['settings', 'settings', 'Setting']] as [Tab, NavGlyphKind, string][]).map(([page, icon, label]) => <Pressable key={page} onPress={() => { setTab(page); setQuery(''); }} style={s.navItem}><NavGlyph kind={icon} color={tab === page ? colors.primaryDark : colors.muted} active={tab === page} palette={colors} /><Text style={[s.navLabel, { color: tab === page ? colors.primaryDark : colors.muted }]}>{label}</Text></Pressable>)}
+          {([['today', 'home', 'Hôm nay'], ['calendar', 'calendar', 'Lịch'], ['settings', 'settings', 'Setting']] as [Tab, NavGlyphKind, string][]).map(([page, icon, label]) => <Pressable key={page} onPress={() => { setTab(page); setQuery(''); }} style={s.navItem}><NavGlyph kind={icon} color={tab === page ? colors.primaryDark : colors.muted} active={tab === page} palette={colors} /><Text style={[s.navLabel, { color: tab === page ? colors.primaryDark : colors.muted }]}>{label}</Text></Pressable>)}
         </View>
       </View>
 
-      <Modal visible={visible} animationType="slide" transparent onRequestClose={() => { setVisible(false); if (recorderState.isRecording) recorder.stop().catch(() => undefined); }}>
+      <Modal visible={visible} animationType="slide" transparent onRequestClose={closeComposer}>
         <KeyboardAvoidingView style={s.overlay} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-          <Pressable style={StyleSheet.absoluteFill} onPress={() => setVisible(false)} />
+          <Pressable style={StyleSheet.absoluteFill} onPress={closeComposer} />
           <View style={[s.sheet, { backgroundColor: colors.paper, maxWidth: tablet ? 620 : 600 }]}>
             <View style={[s.handle, { backgroundColor: colors.line }]} />
-            <View style={s.sheetHead}><View><Text style={[s.sheetTitle, { color: colors.ink }]}>{editing ? 'Sửa điều đã ghi' : 'Ghi nhanh một điều'}</Text><Text style={[s.sectionCaption, { color: colors.muted }]}>Viết vài chữ, chụp ảnh hay ghi âm đều được.</Text></View><Pressable onPress={() => setVisible(false)} style={[s.close, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink, fontSize: 20 }}>×</Text></Pressable></View>
+            <View style={s.sheetHead}><View><Text style={[s.sheetTitle, { color: colors.ink }]}>{composerMode === 'voice' ? 'Ghi âm' : composerMode === 'note' ? editing ? 'Sửa ghi chú' : 'Ghi chú' : editing ? 'Sửa việc cần nhớ' : 'Thêm việc cần nhớ'}</Text><Text style={[s.sectionCaption, { color: colors.muted }]}>{composerMode === 'voice' ? 'Chạm nút lớn để bắt đầu nói.' : composerMode === 'note' ? 'Ghi lại điều bạn muốn giữ.' : 'Thêm một việc cần nhớ.'}</Text></View><Pressable onPress={closeComposer} style={[s.close, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink, fontSize: 20 }}>×</Text></Pressable></View>
             <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 20 }}>
-              <TextInput value={draft.title} onChangeText={(title) => setDraft((current) => ({ ...current, title }))} placeholder="Tiêu đề ngắn gọn..." placeholderTextColor={colors.muted} style={[s.input, { borderColor: colors.line, backgroundColor: colors.surface, color: colors.ink }]} />
-              <TextInput value={draft.body} onChangeText={(body) => setDraft((current) => ({ ...current, body }))} placeholder={draft.kind === 'note' ? 'Viết thêm điều bạn muốn nhớ...' : 'Ghi chú thêm (không bắt buộc)'} placeholderTextColor={colors.muted} multiline textAlignVertical="top" style={[s.bodyInput, { borderColor: colors.line, backgroundColor: colors.surface, color: colors.ink }]} />
+              {composerMode === 'task' && <TextInput value={draft.title} onChangeText={(title) => setDraft((current) => ({ ...current, title }))} placeholder="Việc cần nhớ là gì?" placeholderTextColor={colors.muted} style={[s.input, { borderColor: colors.line, backgroundColor: colors.surface, color: colors.ink }]} />}
+              <TextInput value={draft.body} onChangeText={(body) => setDraft((current) => ({ ...current, body }))} placeholder={composerMode === 'voice' ? transcribing ? 'Đang nghe và chuyển lời nói thành chữ…' : 'Nội dung bạn nói sẽ hiện ở đây.' : composerMode === 'note' ? 'Viết điều bạn muốn nhớ…' : 'Ghi chú thêm (không bắt buộc)'} placeholderTextColor={colors.muted} multiline textAlignVertical="top" style={[s.bodyInput, composerMode === 'voice' && s.voiceTranscript, { borderColor: colors.line, backgroundColor: colors.surface, color: colors.ink }]} />
               {draft.kind !== 'note' && <><Text style={[s.label, { color: colors.ink }]}>Nhắc mình lúc nào?</Text><View style={s.pills}>
                 <Pill label="Không nhắc" active={!draft.reminderAt} palette={colors} onPress={() => setDraft((current) => ({ ...current, reminderAt: undefined, reminderChoice: undefined }))} />
                 <Pill label="Trong 1 giờ" active={draft.reminderChoice === 'hour'} palette={colors} onPress={() => setDraft((current) => ({ ...current, reminderAt: new Date(Date.now() + 3600000).toISOString(), dueAt: new Date(Date.now() + 3600000).toISOString(), reminderChoice: 'hour' }))} />
                 <Pill label="Tối nay" active={!!draft.reminderAt && new Date(draft.reminderAt).getHours() === 20} palette={colors} onPress={() => setDraft((current) => ({ ...current, reminderAt: today(20), dueAt: today(20), reminderChoice: 'evening' }))} />
                 <Pill label="Ngày mai" active={!!draft.reminderAt && new Date(draft.reminderAt).getDate() !== new Date().getDate()} palette={colors} onPress={() => { const next = new Date(); next.setDate(next.getDate() + 1); next.setHours(9, 0, 0, 0); setDraft((current) => ({ ...current, reminderAt: next.toISOString(), dueAt: next.toISOString(), reminderChoice: 'tomorrow' })); }} />
               </View></>}
-              {draft.kind === 'note' && <>
-                <Text style={[s.label, { color: colors.ink }]}>Thêm ảnh vào Note</Text><View style={s.pills}><Button label="📷  Chụp ảnh" palette={colors} onPress={() => choosePhoto(true)} /><Button label="▧  Thư viện" palette={colors} onPress={() => choosePhoto(false)} /></View>
+              {composerMode === 'note' && <>
+                <Text style={[s.label, { color: colors.ink }]}>Ảnh (không bắt buộc)</Text><View style={s.pills}><Button label="📷  Chụp ảnh" palette={colors} onPress={() => choosePhoto(true)} /><Button label="▧  Thư viện" palette={colors} onPress={() => choosePhoto(false)} /></View>
                 {!!draft.imageUris.length && <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 9, paddingVertical: 10 }}>{draft.imageUris.map((uri) => <View key={uri} style={{ position: 'relative' }}><Image source={{ uri }} style={s.preview} /><Pressable onPress={() => setDraft((current) => ({ ...current, imageUris: current.imageUris.filter((value) => value !== uri) }))} style={s.removePhoto}><Text style={{ color: '#FFFFFF', fontWeight: '600' }}>×</Text></Pressable></View>)}</ScrollView>}
               </>}
-              <Text style={[s.label, { color: colors.ink }]}>{transcribing ? 'Đang chuyển giọng nói thành chữ…' : recorderState.isRecording ? 'Đang ghi âm · chạm nút để dừng' : 'Ghi âm giọng nói'}</Text><View style={[s.pills, { alignItems: 'center' }]}><Button label={recorderState.isRecording ? 'Dừng ghi' : 'Bắt đầu ghi'} primary={recorderState.isRecording} palette={colors} onPress={record} />{audioUri && <Text style={{ color: colors.green, fontSize: 10 }}>✓ Đã lưu bản ghi</Text>}</View>
-              {!!audioUri && <View style={s.pills}><AudioPlayback uri={audioUri} palette={colors} />{Platform.OS !== 'web' && <Button label={transcribing ? 'Đang chuyển thành chữ…' : 'A  Chuyển thành văn bản'} palette={colors} onPress={transcribe} />}</View>}
-              <View style={s.actions}>{editing && <Pressable onPress={removeEntry} style={[s.delete, { borderColor: colors.line }]}><Text style={{ color: colors.primaryDark }}>Xóa mục</Text></Pressable>}<View style={{ flex: 1 }} /><Pressable onPress={() => setVisible(false)} style={[s.cancel, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink }}>Để sau</Text></Pressable><Pressable onPress={save} style={[s.save, { backgroundColor: colors.primary }]}><Text style={{ color: '#FFFFFF', fontWeight: '600' }}>Lưu lại ✿</Text></Pressable></View>
+              {composerMode === 'voice' && <View style={s.voiceControls}>
+                <Pressable accessibilityRole="button" accessibilityLabel={recorderState.isRecording ? 'Dừng và lưu ghi âm' : 'Bắt đầu ghi âm'} onPress={record} style={({ pressed }) => [s.voiceRecordButton, { backgroundColor: recorderState.isRecording ? '#C84535' : colors.primary, opacity: pressed ? 0.82 : 1 }]}>
+                  <MicIcon color="#FFFFFF" />
+                  <Text style={s.voiceRecordLabel}>{recorderState.isRecording ? 'Dừng và lưu' : 'Bắt đầu ghi âm'}</Text>
+                </Pressable>
+                <Text style={[s.sectionCaption, { color: colors.muted, textAlign: 'center' }]}>{recorderState.isRecording ? transcribing ? 'Đang ghi và chuyển giọng nói thành chữ…' : 'Đang ghi âm…' : 'Bản ghi âm và phần chữ sẽ tự lưu khi dừng.'}</Text>
+              </View>}
+              {!!audioUri && composerMode !== 'voice' && <View style={s.pills}><AudioPlayback uri={audioUri} palette={colors} />{composerMode === 'note' && <Text style={{ color: colors.green, fontSize: 10 }}>Có bản ghi âm</Text>}</View>}
+              <View style={s.actions}>{editing && <Pressable onPress={removeEntry} style={[s.delete, { borderColor: colors.line }]}><Text style={{ color: colors.primaryDark }}>Xóa mục</Text></Pressable>}<View style={{ flex: 1 }} />{composerMode !== 'voice' && <><Pressable onPress={closeComposer} style={[s.cancel, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink }}>Để sau</Text></Pressable><Pressable onPress={save} style={[s.save, { backgroundColor: colors.primary }]}><Text style={{ color: '#FFFFFF', fontWeight: '600' }}>{composerMode === 'note' ? 'Lưu ghi chú' : 'Lưu lại ✿'}</Text></Pressable></>}</View>
             </ScrollView>
           </View>
         </KeyboardAvoidingView>
@@ -514,14 +641,14 @@ function EntryRow({ item, palette, onOpen, onToggle, compact, petIcon }: { item:
 function Empty({ palette, emoji, title, label, onPress, petIcon }: { palette: (typeof palettes)[ThemeName]; emoji: string; title: string; label: string; onPress: () => void; petIcon?: number }) {
   return <View style={[s.empty, { backgroundColor: palette.surface, borderColor: palette.line }]}>{petIcon ? <Image source={petIcon} style={s.emptyPet} /> : <Text style={{ fontSize: 32 }}>{emoji}</Text>}<Text style={[s.sectionTitle, { color: palette.ink }]}>{title}</Text><Button label={label} primary palette={palette} onPress={onPress} /></View>;
 }
-function QuickActions({ palette, recording, onRecord, onAdd, addLabel }: { palette: (typeof palettes)[ThemeName]; recording: boolean; onRecord: () => void | Promise<void>; onAdd: () => void; addLabel: string }) {
+function QuickActions({ palette, onRecord, onAdd, addLabel }: { palette: (typeof palettes)[ThemeName]; onRecord: () => void | Promise<void>; onAdd: () => void; addLabel: string }) {
   return <View style={s.quickActions}>
-    <Pressable accessibilityLabel="Ghi âm nhanh" onPress={onRecord} style={({ pressed }) => [s.quickActionButton, { backgroundColor: recording ? '#C84535' : palette.surfaceAlt, borderColor: recording ? '#C84535' : palette.line, opacity: pressed ? 0.8 : 1 }]}>
-      {recording ? <Text style={{ color: '#FFFFFF', fontSize: 15 }}>■</Text> : <MicIcon color={palette.primaryDark} />}
-      <Text numberOfLines={1} style={[s.quickActionLabel, { color: recording ? '#FFFFFF' : palette.ink }]}>{recording ? 'Dừng' : 'Ghi âm'}</Text>
+    <Pressable accessibilityRole="button" accessibilityLabel="Ghi âm" onPress={onRecord} style={({ pressed }) => [s.quickActionButton, { backgroundColor: palette.surfaceAlt, borderColor: palette.line, opacity: pressed ? 0.8 : 1 }]}>
+      <MicIcon color={palette.primaryDark} />
+      <Text numberOfLines={1} style={[s.quickActionLabel, { color: palette.ink }]}>Ghi âm</Text>
     </Pressable>
     <Pressable accessibilityLabel={addLabel} onPress={onAdd} style={({ pressed }) => [s.quickActionButton, { backgroundColor: palette.primary, borderColor: palette.primary, opacity: pressed ? 0.82 : 1 }]}>
-      <Text style={{ color: '#FFFFFF', fontSize: 19, lineHeight: 20, fontWeight: '500' }}>＋</Text>
+      <Text style={{ color: '#FFFFFF', fontSize: 15, lineHeight: 18, fontWeight: '700' }}>✎</Text>
       <Text numberOfLines={1} style={[s.quickActionLabel, { color: '#FFFFFF' }]}>{addLabel}</Text>
     </Pressable>
   </View>;
@@ -586,6 +713,7 @@ const s = StyleSheet.create({
   photo: { width: '100%', height: 95, borderRadius: 4, marginBottom: 8, backgroundColor: '#EADFD4' }, photoPlaceholder: { justifyContent: 'center', alignItems: 'center' },
   noteTitle: { fontSize: 14, fontWeight: '600', lineHeight: 19 }, noteBody: { fontSize: 12, lineHeight: 17, marginTop: 4 }, noteDate: { fontSize: 9, marginTop: 8 },
   calendarBanner: { flexDirection: 'row', alignItems: 'center', gap: 12, padding: 14, borderRadius: 17, marginVertical: 17 },
+  calendarTabs: { flexDirection: 'row', gap: 5, padding: 4, borderRadius: 14, marginBottom: 14 }, calendarTab: { flex: 1, minHeight: 38, borderWidth: 1, borderRadius: 11, alignItems: 'center', justifyContent: 'center' },
   integration: { borderWidth: 1, borderRadius: 15, flexDirection: 'row', alignItems: 'center', gap: 10, padding: 12, marginTop: 12 },
   integrationTitle: { fontSize: 11, fontWeight: '600' }, integrationSub: { fontSize: 9, marginTop: 3 },
   themeChoice: { flexDirection: 'row', alignItems: 'center', gap: 11, borderWidth: 1.5, borderRadius: 16, padding: 11 },
@@ -599,6 +727,7 @@ const s = StyleSheet.create({
   sheetTitle: { fontSize: 20, fontWeight: '600' }, close: { width: 31, height: 31, borderRadius: 11, alignItems: 'center', justifyContent: 'center' },
   label: { fontSize: 11, fontWeight: '600', marginTop: 10, marginBottom: 7 }, input: { borderWidth: 1, borderRadius: 12, paddingHorizontal: 11, paddingVertical: 10, minHeight: 46, fontSize: 15, marginBottom: 8 },
   bodyInput: { borderWidth: 1, borderRadius: 12, paddingHorizontal: 11, paddingVertical: 10, minHeight: 82, fontSize: 14, marginBottom: 2 },
+  voiceTranscript: { minHeight: 165, fontSize: 16, lineHeight: 24, padding: 15 }, voiceControls: { alignItems: 'center', gap: 11, marginTop: 18 }, voiceRecordButton: { width: '100%', minHeight: 76, borderRadius: 20, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 12 }, voiceRecordLabel: { color: '#FFFFFF', fontSize: 17, fontWeight: '700' },
   color: { width: 25, height: 25, borderRadius: 13, borderWidth: 2, marginRight: 7 }, button: { borderRadius: 11, paddingHorizontal: 11, paddingVertical: 9, alignItems: 'center', justifyContent: 'center' },
   preview: { width: 84, height: 76, borderRadius: 9 }, removePhoto: { position: 'absolute', top: 4, right: 4, width: 21, height: 21, borderRadius: 11, backgroundColor: '#4C403ACC', justifyContent: 'center', alignItems: 'center' },
   actions: { flexDirection: 'row', alignItems: 'center', gap: 7, marginTop: 18 }, delete: { borderWidth: 1, borderRadius: 11, paddingVertical: 10, paddingHorizontal: 11 },
