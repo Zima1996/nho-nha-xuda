@@ -37,7 +37,7 @@ jobs:
         working-directory: app
         env:
           # OAuth web client IDs are public identifiers; Google restricts this one to the Pages origin.
-          EXPO_PUBLIC_GOOGLE_CLIENT_ID: 10505453543505-gvg5avso71ge2hrb6cempd12ifjbjd2v.apps.googleusercontent.com
+          EXPO_PUBLIC_GOOGLE_CLIENT_ID: ${{ vars.GOOGLE_OAUTH_CLIENT_ID || '10505453543505-gvg5avso71ge2hrb6cempd12ifjbjd2v.apps.googleusercontent.com' }}
         run: pnpm exec expo export --platform web
       - name: Keep Expo asset directory on GitHub Pages
         working-directory: app

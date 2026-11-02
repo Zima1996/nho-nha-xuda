@@ -1,5 +1,4 @@
-import { useAudioRecorder, useAudioRecorderState, RecordingPresets, requestRecordingPermissionsAsync, setAudioModeAsync } from 'expo-audio';
-import { File, Paths } from 'expo-file-system';
+import { useAudioRecorder, useAudioRecorderState, RecordingPresets, IOSOutputFormat, getRecordingPermissionsAsync, requestRecordingPermissionsAsync, setAudioModeAsync } from 'expo-audio';
 import * as ImagePicker from 'expo-image-picker';
 import * as Notifications from 'expo-notifications';
 import { ExpoSpeechRecognitionModule, useSpeechRecognitionEvent } from 'expo-speech-recognition';
@@ -12,13 +11,16 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { entryColorOptions, palettes } from '@/constants/palettes';
 import { AudioPlayback } from '@/components/AudioPlayback';
-import { loadAppData, localDayKey, rollOverDailyItems, saveAppData, starterData } from '@/data/local-store';
-import { getGoogleAccountEmail, requestGoogleAccessToken, syncGoogleCalendar } from '@/services/google-calendar';
+import { MediaImage } from '@/components/MediaImage';
+import { loadAppData, localDayKey, rollOverDailyItems, saveAppData, starterData, updateEntries } from '@/data/local-store';
+import { saveMedia } from '@/data/media-store';
+import { deleteGoogleCalendarEvent, getGoogleAccountEmail, requestGoogleAccessToken, syncGoogleCalendar, updateGoogleCalendarEvent } from '@/services/google-calendar';
 import type { AppData, Entry, EntryKind, ThemeName } from '@/types/entry';
 
 type Tab = 'today' | 'calendar' | 'settings';
 type CalendarSection = 'events' | 'notes';
-type ComposerMode = 'task' | 'note' | 'voice';
+type CalendarViewMode = 'month' | 'week' | 'day';
+type ComposerMode = 'task' | 'note' | 'voice' | 'event';
 type Draft = Omit<Entry, 'id' | 'createdAt'>;
 type BrowserSpeechResult = { transcript: string };
 type BrowserSpeechEvent = Event & { resultIndex: number; results: ArrayLike<ArrayLike<BrowserSpeechResult> & { isFinal: boolean }> };
@@ -69,16 +71,38 @@ function today(hour: number) {
 function when(value?: string) {
   return value ? new Date(value).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' }) : '';
 }
-function persistMedia(uri: string, extension: string) {
-  const saved = new File(Paths.document, 'nho-nha-' + id() + extension);
-  new File(uri).copy(saved);
-  return saved.uri;
+function googleErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : 'Hãy thử lại sau nhé.';
+  if (/invalid_client|client was not found|oauth client.*not found/i.test(message)) {
+    return 'Google không tìm thấy OAuth Client ID của app (401 invalid_client). Trong Google Cloud, hãy dùng OAuth client loại Web application, thêm https://zima1996.github.io vào Authorized JavaScript origins, rồi cập nhật Client ID đang dùng trong GitHub Actions. Không thể sửa cấu hình Cloud từ trong app.';
+  }
+  return message;
 }
-
+function calendarDates(focus: Date, mode: CalendarViewMode): Date[] {
+  const start = new Date(focus.getFullYear(), focus.getMonth(), focus.getDate());
+  if (mode === 'day') return [start];
+  const mondayOffset = (start.getDay() + 6) % 7;
+  if (mode === 'week') {
+    start.setDate(start.getDate() - mondayOffset);
+    return Array.from({ length: 7 }, (_, index) => { const day = new Date(start); day.setDate(start.getDate() + index); return day; });
+  }
+  start.setDate(1);
+  start.setDate(start.getDate() - ((start.getDay() + 6) % 7));
+  return Array.from({ length: 42 }, (_, index) => { const day = new Date(start); day.setDate(start.getDate() + index); return day; });
+}
+function calendarHeading(date: Date, mode: CalendarViewMode): string {
+  if (mode === 'month') return date.toLocaleDateString('vi-VN', { month: 'long', year: 'numeric' });
+  if (mode === 'day') return date.toLocaleDateString('vi-VN', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+  const end = new Date(date); end.setDate(end.getDate() + 6);
+  return `${date.toLocaleDateString('vi-VN', { day: 'numeric', month: 'short' })} – ${end.toLocaleDateString('vi-VN', { day: 'numeric', month: 'short', year: 'numeric' })}`;
+}
 export default function HomeScreen() {
   const { width } = useWindowDimensions();
   const [tab, setTab] = useState<Tab>('today');
   const [calendarSection, setCalendarSection] = useState<CalendarSection>('events');
+  const [calendarMode, setCalendarMode] = useState<CalendarViewMode>('month');
+  const [calendarFocus, setCalendarFocus] = useState(() => { const todayDate = new Date(); todayDate.setHours(0, 0, 0, 0); return todayDate; });
+  const [eventDetail, setEventDetail] = useState<Entry | null>(null);
   const [data, setData] = useState<AppData>(starterData);
   const [ready, setReady] = useState(false);
   const [loadFailed, setLoadFailed] = useState(false);
@@ -92,7 +116,10 @@ export default function HomeScreen() {
   const [visible, setVisible] = useState(false);
   const [composerMode, setComposerMode] = useState<ComposerMode>('task');
   const [draft, setDraft] = useState<Draft>(newDraft());
+  const [eventDateText, setEventDateText] = useState('');
+  const [eventTimeText, setEventTimeText] = useState('09:00');
   const [audioUri, setAudioUri] = useState<string>();
+  const [voiceSaveError, setVoiceSaveError] = useState(false);
   const [transcript, setTranscript] = useState('');
   const [transcribing, setTranscribing] = useState(false);
   const transcriptRef = useRef('');
@@ -104,7 +131,24 @@ export default function HomeScreen() {
   const pendingVoiceAudioRef = useRef<string | undefined>(undefined);
   const browserRecognitionEndRef = useRef<(() => void) | null>(null);
   const finishVoiceNoteRef = useRef<(() => void) | null>(null);
-  const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
+  const voiceSaveBusyRef = useRef(false);
+  const recordingOptions = useMemo(() => {
+    if (Platform.OS === 'ios') return {
+      ...RecordingPresets.HIGH_QUALITY,
+      extension: '.mp3',
+      ios: { ...RecordingPresets.HIGH_QUALITY.ios, outputFormat: IOSOutputFormat.MPEGLAYER3 },
+    };
+    if (Platform.OS === 'web') {
+      const supportsMp4 = typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported('audio/mp4');
+      return {
+        ...RecordingPresets.HIGH_QUALITY,
+        extension: supportsMp4 ? '.m4a' : '.webm',
+        web: { mimeType: supportsMp4 ? 'audio/mp4' : 'audio/webm', bitsPerSecond: 128_000 },
+      };
+    }
+    return RecordingPresets.HIGH_QUALITY;
+  }, []);
+  const recorder = useAudioRecorder(recordingOptions);
   const recorderState = useAudioRecorderState(recorder);
   const tablet = width >= 760;
   const colors = palettes[data.theme];
@@ -169,30 +213,55 @@ export default function HomeScreen() {
   const list = useMemo(() => {
     let result = data.entries;
     if (tab === 'today') result = result.filter((item) => (item.kind === 'task' || item.kind === 'routine') && (!item.dayKey || item.dayKey <= todayKey));
-    if (tab === 'calendar') result = result.filter((item) => calendarSection === 'events' ? item.kind === 'event' : item.kind === 'note');
+    if (tab === 'calendar') result = result.filter((item) => calendarSection === 'events'
+      ? item.kind === 'event' && !!item.dueAt && localDayKey(new Date(item.dueAt)) === localDayKey(calendarFocus)
+      : item.kind === 'note');
     if (query.trim()) {
       const needle = query.trim().toLocaleLowerCase('vi');
       result = result.filter((item) => (item.title + ' ' + item.body + ' ' + (item.transcript || '')).toLocaleLowerCase('vi').includes(needle));
     }
     return [...result].sort((a, b) => (a.dueAt || a.createdAt).localeCompare(b.dueAt || b.createdAt));
-  }, [data.entries, tab, calendarSection, query, todayKey]);
+  }, [data.entries, tab, calendarSection, calendarFocus, query, todayKey]);
+  const calendarCells = useMemo(() => calendarDates(calendarFocus, calendarMode), [calendarFocus, calendarMode]);
+
+  function moveCalendar(direction: -1 | 1) {
+    setCalendarFocus((current) => {
+      const next = new Date(current);
+      if (calendarMode === 'month') next.setMonth(next.getMonth() + direction, 1);
+      else next.setDate(next.getDate() + direction * (calendarMode === 'week' ? 7 : 1));
+      return next;
+    });
+  }
 
   function begin(kindValue: EntryKind = 'task', item?: Entry, mode?: ComposerMode) {
     setEditing(item?.id || null);
-    setComposerMode(mode || (kindValue === 'note' ? 'note' : 'task'));
+    setComposerMode(mode || (kindValue === 'note' ? 'note' : kindValue === 'event' ? 'event' : 'task'));
     if (item) {
       const { id: _id, createdAt: _created, ...rest } = item;
       setDraft({ ...rest, imageUris: [...item.imageUris] });
       setAudioUri(item.audioUri);
       setTranscript(item.transcript || '');
+      if (kindValue === 'event') {
+        const date = item.dueAt ? new Date(item.dueAt) : calendarFocus;
+        setEventDateText(localDayKey(date));
+        setEventTimeText(when(item.dueAt) || '09:00');
+      }
     } else {
-      setDraft(newDraft(kindValue)); setAudioUri(undefined); setTranscript('');
+      const blank = newDraft(kindValue);
+      if (kindValue === 'event') {
+        const date = new Date(calendarFocus); date.setHours(9, 0, 0, 0);
+        blank.dueAt = date.toISOString();
+        setEventDateText(localDayKey(date)); setEventTimeText('09:00');
+      } else { setEventDateText(''); setEventTimeText('09:00'); }
+      setDraft(blank); setAudioUri(undefined); setTranscript('');
     }
     transcriptRef.current = item?.transcript || '';
     setVisible(true);
   }
   function beginVoiceNote() {
     autoSaveVoiceRef.current = true;
+    voiceSaveBusyRef.current = false;
+    setVoiceSaveError(false);
     pendingVoiceAudioRef.current = undefined;
     begin('note', undefined, 'voice');
   }
@@ -200,6 +269,12 @@ export default function HomeScreen() {
     autoSaveVoiceRef.current = false;
     pendingVoiceAudioRef.current = undefined;
     begin('note', item, 'note');
+  }
+  async function chooseTheme(theme: ThemeName) {
+    const nextData = { ...data, theme };
+    setData(nextData);
+    try { await saveAppData(nextData); }
+    catch { Alert.alert('Chưa lưu được màu sắc', 'Theme đã đổi tạm thời. Hãy thử lại sau khi thiết bị hoạt động bình thường.'); }
   }
   function put(item: Entry) {
     setData((current) => ({
@@ -209,29 +284,44 @@ export default function HomeScreen() {
         : [item, ...current.entries],
     }));
   }
-  function finishVoiceNote() {
+  async function persistEntry(item: Entry) {
+    const nextData: AppData = { ...data, entries: updateEntries(data.entries, item) };
+    setData(nextData);
+    await saveAppData(nextData);
+  }
+  async function finishVoiceNote() {
     const audio = pendingVoiceAudioRef.current;
-    if (!audio || !autoSaveVoiceRef.current) return;
+    if (!audio || !autoSaveVoiceRef.current || voiceSaveBusyRef.current) return;
+    voiceSaveBusyRef.current = true;
     const body = draft.body.trim() || transcriptRef.current.trim();
     const now = new Date();
     const title = body.split('\n')[0]?.trim().slice(0, 54) || `Bản ghi âm · ${when(now.toISOString())}`;
     const item: Entry = {
       ...newDraft('note'),
-      id: id(),
+      id: data.entries.find((entry) => entry.kind === 'note' && entry.audioUri === audio)?.id || id(),
       title,
       body,
       transcript: body,
       audioUri: audio,
+      imageUris: [...draft.imageUris],
       createdAt: now.toISOString(),
     };
-    put(item);
-    autoSaveVoiceRef.current = false;
-    pendingVoiceAudioRef.current = undefined;
-    setVisible(false);
-    setTranscribing(false);
-    Alert.alert('Đã lưu ghi âm', 'Bản ghi và phần chữ đã được lưu trong Ghi chú ở tab Lịch.');
+    try {
+      await persistEntry(item);
+      autoSaveVoiceRef.current = false;
+      pendingVoiceAudioRef.current = undefined;
+      setVoiceSaveError(false);
+      setVisible(false);
+      setTranscribing(false);
+      Alert.alert('Đã lưu ghi âm', 'Bản ghi, phần chữ và ảnh đã được lưu trong Ghi chú ở tab Lịch.');
+    } catch {
+      setVoiceSaveError(true);
+      Alert.alert('Chưa lưu được ghi âm', 'Bản ghi vẫn đang mở. Hãy chạm “Thử lưu lại” để lưu lần nữa.');
+    } finally {
+      voiceSaveBusyRef.current = false;
+    }
   }
-  finishVoiceNoteRef.current = finishVoiceNote;
+  finishVoiceNoteRef.current = () => { void finishVoiceNote(); };
   async function connectGoogle() {
     const clientId = process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID;
     if (!clientId) {
@@ -246,7 +336,7 @@ export default function HomeScreen() {
       setData((current) => ({ ...current, googleEmail: email || current.googleEmail }));
       Alert.alert('Đã kết nối Google', email ? `Đang dùng ${email}.` : 'Bạn đã cấp quyền Google.');
     } catch (error) {
-      Alert.alert('Chưa đăng nhập được', error instanceof Error ? error.message : 'Hãy thử lại sau nhé.');
+      Alert.alert('Chưa đăng nhập được', googleErrorMessage(error));
     } finally { setGoogleBusy(false); }
   }
   async function syncCalendar() {
@@ -266,7 +356,7 @@ export default function HomeScreen() {
       setData((current) => ({ ...current, entries: result.entries, googleEmail: email || current.googleEmail, googleLastSyncedAt: syncedAt }));
       Alert.alert('Đã đồng bộ lịch', `Đã nhập ${result.imported} sự kiện và thêm ${result.uploaded} sự kiện lên Google Calendar.`);
     } catch (error) {
-      Alert.alert('Chưa đồng bộ được', error instanceof Error ? error.message : 'Hãy kiểm tra kết nối rồi thử lại nhé.');
+      Alert.alert('Chưa đồng bộ được', googleErrorMessage(error));
     } finally { setGoogleBusy(false); }
   }
   async function setReminder(item: Entry) {
@@ -290,6 +380,16 @@ export default function HomeScreen() {
       ? previous?.title || noteContent.split('\n')[0]?.slice(0, 54) || (draft.imageUris.length ? `Ghi chú · ${when(new Date().toISOString())}` : '')
       : draft.title.trim() || noteContent.split('\n')[0]?.slice(0, 54) || transcript.trim().split('\n')[0]?.slice(0, 54) || (audioUri ? 'Bản ghi âm mới' : '');
     if (!title) { Alert.alert('Thêm một chút nội dung nhé', 'Viết ghi chú hoặc thêm ảnh trước khi lưu.'); return; }
+    let eventDueAt = previous?.dueAt;
+    if (draft.kind === 'event') {
+      const dateParts = /^(\d{4})-(\d{2})-(\d{2})$/.exec(eventDateText);
+      const timeParts = /^(\d{2}):(\d{2})$/.exec(eventTimeText);
+      const parsedDueAt = dateParts && timeParts ? new Date(Number(dateParts[1]), Number(dateParts[2]) - 1, Number(dateParts[3]), Number(timeParts[1]), Number(timeParts[2])) : new Date(NaN);
+      if (!dateParts || !timeParts || Number(dateParts[2]) < 1 || Number(dateParts[2]) > 12 || Number(dateParts[3]) !== parsedDueAt.getDate() || Number(dateParts[2]) - 1 !== parsedDueAt.getMonth() || Number(timeParts[1]) > 23 || Number(timeParts[2]) > 59 || Number.isNaN(parsedDueAt.getTime())) {
+        Alert.alert('Kiểm tra ngày và giờ', 'Nhập ngày theo dạng YYYY-MM-DD và giờ theo dạng HH:MM.'); return;
+      }
+      eventDueAt = parsedDueAt.toISOString();
+    }
     if (previous?.notificationId && (!draft.reminderAt || draft.reminderAt !== previous.reminderAt)) {
       Notifications.cancelScheduledNotificationAsync(previous.notificationId).catch(() => undefined);
     }
@@ -297,18 +397,60 @@ export default function HomeScreen() {
       ...draft, title, id: editing || id(), createdAt: previous?.createdAt || new Date().toISOString(),
       audioUri: audioUri || draft.audioUri, transcript: transcript || draft.transcript,
       ...((draft.kind === 'task' || draft.kind === 'routine') ? { dayKey: previous?.dayKey || todayKey } : {}),
+      ...(draft.kind === 'event' ? { dueAt: eventDueAt, endAt: previous?.endAt || (eventDueAt ? new Date(new Date(eventDueAt).getTime() + 30 * 60_000).toISOString() : undefined) } : {}),
     };
+    if (item.kind === 'event' && item.googleEventId) {
+      const clientId = process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID;
+      if (!clientId) { Alert.alert('Chưa cập nhật được Google Calendar', 'Hãy cấu hình lại đăng nhập Google trước khi sửa sự kiện đã đồng bộ.'); return; }
+      setGoogleBusy(true);
+      try {
+        const token = googleAccessToken || await requestGoogleAccessToken(clientId);
+        await updateGoogleCalendarEvent(token, item);
+        setGoogleAccessToken(token);
+      } catch (error) {
+        Alert.alert('Chưa cập nhật được Google Calendar', googleErrorMessage(error));
+        setGoogleBusy(false);
+        return;
+      }
+      setGoogleBusy(false);
+    }
     if (item.reminderAt && (!previous || item.reminderAt !== previous.reminderAt)) {
       try { item.notificationId = await setReminder(item); }
       catch { Alert.alert('Nhắc nhở chưa bật', 'Bạn có thể bật quyền thông báo trong Cài đặt iPhone.'); }
     }
-    put(item); setVisible(false);
+    try {
+      await persistEntry(item);
+      setVisible(false);
+    } catch {
+      setEditing(item.id);
+      Alert.alert('Chưa lưu được ghi chú', 'Ghi chú vẫn đang mở. Hãy thử lưu lại khi thiết bị sẵn sàng.');
+    }
   }
-  function removeEntry() {
-    const item = data.entries.find((entry) => entry.id === editing);
-    if (item?.notificationId) Notifications.cancelScheduledNotificationAsync(item.notificationId).catch(() => undefined);
-    setData((current) => ({ ...current, entries: current.entries.filter((entry) => entry.id !== editing) }));
+  async function removeEntry(entryId = editing) {
+    const item = data.entries.find((entry) => entry.id === entryId);
+    if (!item || !entryId) return;
+    if (item.googleEventId) {
+      const clientId = process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID;
+      if (!clientId) { Alert.alert('Chưa xóa được sự kiện', 'Hãy cấu hình lại đăng nhập Google trước khi xóa sự kiện đã đồng bộ.'); return; }
+      setGoogleBusy(true);
+      try {
+        const token = googleAccessToken || await requestGoogleAccessToken(clientId);
+        await deleteGoogleCalendarEvent(token, item.googleEventId);
+        setGoogleAccessToken(token);
+      } catch (error) {
+        Alert.alert('Chưa xóa được sự kiện Google', error instanceof Error ? error.message : 'Hãy kết nối lại Google rồi thử lần nữa.');
+        setGoogleBusy(false);
+        return;
+      }
+      setGoogleBusy(false);
+    }
+    if (item.notificationId) Notifications.cancelScheduledNotificationAsync(item.notificationId).catch(() => undefined);
+    const nextData = { ...data, entries: data.entries.filter((entry) => entry.id !== entryId) };
+    setData(nextData);
+    try { await saveAppData(nextData); }
+    catch { Alert.alert('Chưa lưu thay đổi', 'Sự kiện đã được xóa khỏi Google Calendar, nhưng app chưa lưu được thay đổi trên thiết bị. Hãy đồng bộ lại.'); return; }
     setVisible(false);
+    setEventDetail(null);
   }
   async function choosePhoto(camera: boolean) {
     try {
@@ -316,7 +458,7 @@ export default function HomeScreen() {
         ? await ImagePicker.launchCameraAsync({ mediaTypes: ['images'], quality: 0.82, allowsEditing: true })
         : await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 0.82, allowsEditing: true });
       if (!result.canceled && result.assets[0]?.uri) {
-        const uri = persistMedia(result.assets[0].uri, '.jpg');
+        const uri = await saveMedia(result.assets[0].uri, '.jpg');
         setDraft((value) => ({ ...value, imageUris: [...value.imageUris, uri] }));
       }
     } catch { Alert.alert('Chưa thêm được ảnh', 'Thử chụp ảnh hoặc chọn lại từ thư viện nhé.'); }
@@ -354,7 +496,8 @@ export default function HomeScreen() {
         if (Platform.OS === 'web') await stopBrowserTranscription();
         await recorder.stop();
         if (recorder.uri) {
-          const uri = persistMedia(recorder.uri, '.m4a');
+          const fallbackExtension = Platform.OS === 'ios' ? '.mp3' : '.m4a';
+          const uri = await saveMedia(recorder.uri, fallbackExtension);
           setAudioUri(uri); setDraft((value) => ({ ...value, audioUri: uri }));
           if (composerMode === 'voice') {
             pendingVoiceAudioRef.current = uri;
@@ -363,8 +506,9 @@ export default function HomeScreen() {
           }
         }
       } else {
-        const permission = await requestRecordingPermissionsAsync();
-        if (!permission.granted) { Alert.alert('Cần quyền micro', 'Cho phép dùng micro để ghi âm ghi chú.'); return; }
+        let permission = await getRecordingPermissionsAsync();
+        if (!permission.granted && permission.canAskAgain) permission = await requestRecordingPermissionsAsync();
+        if (!permission.granted) { Alert.alert('Cần quyền micro', 'Hãy bật quyền micro cho Nhớ nha Xuda trong Cài đặt iPhone để ghi âm.'); return; }
         await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
         await recorder.prepareToRecordAsync(); recorder.record();
         if (Platform.OS === 'web') startBrowserTranscription();
@@ -482,19 +626,24 @@ export default function HomeScreen() {
           </>}
           {tab === 'calendar' && <>
             <View style={s.sectionTop}><Text style={[s.sectionTitle, { color: colors.ink }]}>Lịch</Text><QuickActions palette={colors} onRecord={beginVoiceNote} onAdd={() => beginQuickNote()} addLabel="Ghi chú" /></View>
-            <Text style={[s.title, { color: colors.ink }]}>{calendarSection === 'events' ? 'Sự kiện sắp tới' : 'Ghi chú đã lưu'} <Text style={{ color: colors.primary }}>{calendarSection === 'events' ? '☁' : '✎'}</Text></Text>
+            <Text style={[s.title, { color: colors.ink }]}>{calendarSection === 'events' ? 'Lịch sự kiện' : 'Ghi chú đã lưu'} <Text style={{ color: colors.primary }}>{calendarSection === 'events' ? '☁' : '✎'}</Text></Text>
             <Text style={[s.subtitle, { color: colors.muted }]}>{calendarSection === 'events' ? 'Các sự kiện dài hạn từ app và Google Calendar.' : 'Ảnh, chữ và bản ghi âm được giữ lại lâu dài.'}</Text>
             <View style={[s.calendarTabs, { backgroundColor: colors.surfaceAlt }]}>
               {([['events', 'Sự kiện'], ['notes', 'Ghi chú']] as [CalendarSection, string][]).map(([section, label]) => <Pressable key={section} onPress={() => { setCalendarSection(section); setQuery(''); }} style={[s.calendarTab, { backgroundColor: calendarSection === section ? colors.surface : 'transparent', borderColor: calendarSection === section ? colors.line : 'transparent' }]}><Text style={{ color: calendarSection === section ? colors.ink : colors.muted, fontWeight: '600', fontSize: 12 }}>{label}</Text></Pressable>)}
             </View>
+            {calendarSection === 'events' && <>
+              <View style={s.calendarTitleRow}><Pressable accessibilityLabel="Lùi lịch" onPress={() => moveCalendar(-1)} style={[s.calendarArrow, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink, fontSize: 20 }}>‹</Text></Pressable><Text style={[s.calendarHeading, { color: colors.ink }]}>{calendarHeading(calendarFocus, calendarMode)}</Text><Pressable accessibilityLabel="Tiến lịch" onPress={() => moveCalendar(1)} style={[s.calendarArrow, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink, fontSize: 20 }}>›</Text></Pressable></View>
+              <View style={[s.calendarModes, { backgroundColor: colors.surfaceAlt }]}>{([['month', 'Tháng'], ['week', 'Tuần'], ['day', 'Ngày']] as [CalendarViewMode, string][]).map(([mode, label]) => <Pressable key={mode} onPress={() => setCalendarMode(mode)} style={[s.calendarMode, { backgroundColor: calendarMode === mode ? colors.surface : 'transparent', borderColor: calendarMode === mode ? colors.line : 'transparent' }]}><Text style={{ color: calendarMode === mode ? colors.ink : colors.muted, fontSize: 11, fontWeight: '600' }}>{label}</Text></Pressable>)}</View>
+              <CalendarGrid dates={calendarCells} focus={calendarFocus} mode={calendarMode} entries={data.entries.filter((item) => item.kind === 'event')} palette={colors} onSelect={setCalendarFocus} />
+            </>}
             <Search value={query} onChange={setQuery} palette={colors} />
             {calendarSection === 'events' ? <>
-              <Pressable onPress={syncCalendar} style={[s.integration, { borderColor: colors.line, backgroundColor: colors.surface }]}><Text style={{ fontSize: 22 }}>🗓️</Text><View style={{ flex: 1 }}><Text style={[s.integrationTitle, { color: colors.ink }]}>Google Calendar</Text><Text style={[s.integrationSub, { color: colors.muted }]}>{googleBusy ? 'Đang đồng bộ…' : data.googleEmail ? `Đã kết nối · ${data.googleEmail} · Chạm để đồng bộ` : 'Đăng nhập trong Setting để đồng bộ'}</Text></View><Text style={{ color: colors.primary, fontSize: 21 }}>{data.googleEmail ? '↻' : '›'}</Text></Pressable>
-              {list.map((item) => <EntryRow key={item.id} item={item} palette={colors} petIcon={petFor(item.id, petSeed)} onOpen={() => begin(item.kind, item)} onToggle={() => put({ ...item, status: item.status === 'done' ? 'todo' : 'done' })} />)}
+              <Pressable onPress={syncCalendar} style={[s.integration, { borderColor: colors.line, backgroundColor: colors.surface }]}><Text style={{ fontSize: 22 }}>🗓️</Text><View style={{ flex: 1 }}><Text style={[s.integrationTitle, { color: colors.ink }]}>Google Calendar</Text><Text style={[s.integrationSub, { color: colors.muted }]}>{googleBusy ? 'Đang đồng bộ…' : googleAccessToken && data.googleEmail ? `Đã kết nối · ${data.googleEmail} · Chạm để đồng bộ` : data.googleEmail ? `Tài khoản đã dùng · ${data.googleEmail} · Chạm để kết nối` : 'Đăng nhập trong Setting để đồng bộ'}</Text></View><Text style={{ color: colors.primary, fontSize: 21 }}>{googleAccessToken ? '↻' : '›'}</Text></Pressable>
+              {list.map((item) => <EventRow key={item.id} item={item} palette={colors} petIcon={petFor(item.id, petSeed)} onPress={() => setEventDetail(item)} />)}
               {!list.length && <Empty palette={colors} emoji="☕" petIcon={petFor('empty-calendar', petSeed)} title="Chưa có sự kiện sắp tới" label="Đồng bộ Google Calendar" onPress={() => syncCalendar()} />}
             </> : <>
               <View style={[s.noteGrid, { gap: 10 }]}>{list.map((item, index) => <Pressable key={item.id} onPress={() => beginQuickNote(item)} style={[s.note, { backgroundColor: index % 2 ? colors.surfaceAlt : colors.surface, borderColor: colors.line, width: tablet ? '31.5%' : '48%', transform: [{ rotate: index % 2 ? '0.5deg' : '-0.5deg' }] }]}>
-                {item.imageUris[0] ? <Image source={{ uri: item.imageUris[0] }} style={s.photo} /> : <View style={[s.photo, s.photoPlaceholder, { backgroundColor: colors.surfaceAlt }]}><Image source={petFor(item.id, petSeed)} style={s.placeholderPet} /></View>}
+                {item.imageUris[0] ? <MediaImage uri={item.imageUris[0]} style={s.photo} /> : <View style={[s.photo, s.photoPlaceholder, { backgroundColor: colors.surfaceAlt }]}><Image source={petFor(item.id, petSeed)} style={s.placeholderPet} /></View>}
                 <Text style={[s.noteTitle, { color: colors.ink }]} numberOfLines={2}>{item.title}</Text>
                 {!!item.body && <Text style={[s.noteBody, { color: colors.muted }]} numberOfLines={4}>{item.body}</Text>}
                 {!!item.imageUris.length && <Text style={[s.noteDate, { color: colors.primaryDark }]}>{item.imageUris.length} ảnh</Text>}
@@ -509,14 +658,14 @@ export default function HomeScreen() {
             <Text style={[s.sectionTitle, { color: colors.ink }]}>Màu sắc chủ đạo</Text><Text style={[s.sectionCaption, { color: colors.muted, marginBottom: 12 }]}>Tông ấm, chữ rõ, nét sổ tay handmade.</Text>
             <View style={{ gap: 10 }}>{(Object.keys(palettes) as ThemeName[]).map((key) => {
               const choice = palettes[key]; const selected = data.theme === key;
-              return <Pressable key={key} onPress={() => setData((current) => ({ ...current, theme: key }))} style={[s.themeChoice, { backgroundColor: choice.surface, borderColor: selected ? choice.primary : choice.line }]}>
+              return <Pressable key={key} onPress={() => { void chooseTheme(key); }} style={[s.themeChoice, { backgroundColor: choice.surface, borderColor: selected ? choice.primary : choice.line }]}>
                 <View style={[s.swatches, { backgroundColor: choice.paper }]}>{[choice.accent, choice.primary, choice.green].map((color) => <View key={color} style={[s.swatch, { backgroundColor: color }]} />)}</View>
                 <View style={{ flex: 1 }}><Text style={[s.progressTitle, { color: choice.ink }]}>{choice.name}</Text><Text style={[s.progressCaption, { color: choice.muted }]}>{choice.description}</Text></View><Text style={{ fontSize: 20, color: choice.primary }}>{selected ? '✓' : '○'}</Text>
               </Pressable>;
             })}</View>
             <Text style={[s.sectionTitle, { color: colors.ink, marginTop: 24, marginBottom: 10 }]}>Tài khoản & đồng bộ</Text>
             <View style={[s.integrationBox, { backgroundColor: colors.surface, borderColor: colors.line }]}>
-              <Integration icon="G" title={data.googleEmail ? 'Tài khoản Google' : 'Đăng nhập Google'} sub={googleBusy ? 'Đang kết nối…' : data.googleEmail || 'Dùng tài khoản có Google Calendar'} palette={colors} onPress={connectGoogle} />
+              <Integration icon="G" title={data.googleEmail ? 'Tài khoản Google' : 'Đăng nhập Google'} sub={googleBusy ? 'Đang kết nối…' : data.googleEmail ? googleAccessToken ? `Đã kết nối · ${data.googleEmail}` : `Đã dùng trước đây · ${data.googleEmail} · Chạm để kết nối` : 'Dùng tài khoản có Google Calendar'} palette={colors} onPress={connectGoogle} />
               <View style={[s.divider, { backgroundColor: colors.line }]} />
               <Integration icon="🗓️" title="Google Calendar" sub={googleBusy ? 'Đang đồng bộ…' : data.googleLastSyncedAt ? `Đồng bộ gần nhất · ${new Date(data.googleLastSyncedAt).toLocaleString('vi-VN')}` : 'Chạm để đồng bộ hai chiều'} palette={colors} onPress={syncCalendar} />
             </View>
@@ -535,19 +684,24 @@ export default function HomeScreen() {
           <Pressable style={StyleSheet.absoluteFill} onPress={closeComposer} />
           <View style={[s.sheet, { backgroundColor: colors.paper, maxWidth: tablet ? 620 : 600 }]}>
             <View style={[s.handle, { backgroundColor: colors.line }]} />
-            <View style={s.sheetHead}><View><Text style={[s.sheetTitle, { color: colors.ink }]}>{composerMode === 'voice' ? 'Ghi âm' : composerMode === 'note' ? editing ? 'Sửa ghi chú' : 'Ghi chú' : editing ? 'Sửa việc cần nhớ' : 'Thêm việc cần nhớ'}</Text><Text style={[s.sectionCaption, { color: colors.muted }]}>{composerMode === 'voice' ? 'Chạm nút lớn để bắt đầu nói.' : composerMode === 'note' ? 'Ghi lại điều bạn muốn giữ.' : 'Thêm một việc cần nhớ.'}</Text></View><Pressable onPress={closeComposer} style={[s.close, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink, fontSize: 20 }}>×</Text></Pressable></View>
+            <View style={s.sheetHead}><View><Text style={[s.sheetTitle, { color: colors.ink }]}>{composerMode === 'voice' ? 'Ghi âm' : composerMode === 'note' ? editing ? 'Sửa ghi chú' : 'Ghi chú' : composerMode === 'event' ? editing ? 'Sửa sự kiện' : 'Sự kiện' : editing ? 'Sửa việc cần nhớ' : 'Thêm việc cần nhớ'}</Text><Text style={[s.sectionCaption, { color: colors.muted }]}>{composerMode === 'voice' ? 'Chạm nút lớn để bắt đầu nói.' : composerMode === 'note' ? 'Ghi lại điều bạn muốn giữ.' : composerMode === 'event' ? 'Cập nhật thông tin sự kiện.' : 'Thêm một việc cần nhớ.'}</Text></View><Pressable onPress={closeComposer} style={[s.close, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink, fontSize: 20 }}>×</Text></Pressable></View>
             <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 20 }}>
-              {composerMode === 'task' && <TextInput value={draft.title} onChangeText={(title) => setDraft((current) => ({ ...current, title }))} placeholder="Việc cần nhớ là gì?" placeholderTextColor={colors.muted} style={[s.input, { borderColor: colors.line, backgroundColor: colors.surface, color: colors.ink }]} />}
+              {(composerMode === 'task' || composerMode === 'event') && <TextInput value={draft.title} onChangeText={(title) => setDraft((current) => ({ ...current, title }))} placeholder={composerMode === 'event' ? 'Tên sự kiện' : 'Việc cần nhớ là gì?'} placeholderTextColor={colors.muted} style={[s.input, { borderColor: colors.line, backgroundColor: colors.surface, color: colors.ink }]} />}
+              {composerMode === 'event' && <><Text style={[s.label, { color: colors.ink }]}>Ngày và giờ</Text><View style={s.eventDateFields}><TextInput value={eventDateText} onChangeText={setEventDateText} placeholder="YYYY-MM-DD" placeholderTextColor={colors.muted} style={[s.input, s.eventDateInput, { borderColor: colors.line, backgroundColor: colors.surface, color: colors.ink }]} /><TextInput value={eventTimeText} onChangeText={setEventTimeText} placeholder="HH:MM" placeholderTextColor={colors.muted} style={[s.input, s.eventTimeInput, { borderColor: colors.line, backgroundColor: colors.surface, color: colors.ink }]} /></View></>}
               <TextInput value={draft.body} onChangeText={(body) => setDraft((current) => ({ ...current, body }))} placeholder={composerMode === 'voice' ? transcribing ? 'Đang nghe và chuyển lời nói thành chữ…' : 'Nội dung bạn nói sẽ hiện ở đây.' : composerMode === 'note' ? 'Viết điều bạn muốn nhớ…' : 'Ghi chú thêm (không bắt buộc)'} placeholderTextColor={colors.muted} multiline textAlignVertical="top" style={[s.bodyInput, composerMode === 'voice' && s.voiceTranscript, { borderColor: colors.line, backgroundColor: colors.surface, color: colors.ink }]} />
-              {draft.kind !== 'note' && <><Text style={[s.label, { color: colors.ink }]}>Nhắc mình lúc nào?</Text><View style={s.pills}>
+              {(draft.kind === 'task' || draft.kind === 'routine') && <><Text style={[s.label, { color: colors.ink }]}>Nhắc mình lúc nào?</Text><View style={s.pills}>
                 <Pill label="Không nhắc" active={!draft.reminderAt} palette={colors} onPress={() => setDraft((current) => ({ ...current, reminderAt: undefined, reminderChoice: undefined }))} />
                 <Pill label="Trong 1 giờ" active={draft.reminderChoice === 'hour'} palette={colors} onPress={() => setDraft((current) => ({ ...current, reminderAt: new Date(Date.now() + 3600000).toISOString(), dueAt: new Date(Date.now() + 3600000).toISOString(), reminderChoice: 'hour' }))} />
                 <Pill label="Tối nay" active={!!draft.reminderAt && new Date(draft.reminderAt).getHours() === 20} palette={colors} onPress={() => setDraft((current) => ({ ...current, reminderAt: today(20), dueAt: today(20), reminderChoice: 'evening' }))} />
                 <Pill label="Ngày mai" active={!!draft.reminderAt && new Date(draft.reminderAt).getDate() !== new Date().getDate()} palette={colors} onPress={() => { const next = new Date(); next.setDate(next.getDate() + 1); next.setHours(9, 0, 0, 0); setDraft((current) => ({ ...current, reminderAt: next.toISOString(), dueAt: next.toISOString(), reminderChoice: 'tomorrow' })); }} />
               </View></>}
-              {composerMode === 'note' && <>
-                <Text style={[s.label, { color: colors.ink }]}>Ảnh (không bắt buộc)</Text><View style={s.pills}><Button label="📷  Chụp ảnh" palette={colors} onPress={() => choosePhoto(true)} /><Button label="▧  Thư viện" palette={colors} onPress={() => choosePhoto(false)} /></View>
-                {!!draft.imageUris.length && <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 9, paddingVertical: 10 }}>{draft.imageUris.map((uri) => <View key={uri} style={{ position: 'relative' }}><Image source={{ uri }} style={s.preview} /><Pressable onPress={() => setDraft((current) => ({ ...current, imageUris: current.imageUris.filter((value) => value !== uri) }))} style={s.removePhoto}><Text style={{ color: '#FFFFFF', fontWeight: '600' }}>×</Text></Pressable></View>)}</ScrollView>}
+              {(composerMode === 'note' || composerMode === 'voice') && <>
+                <Text style={[s.label, { color: colors.ink }]}>{composerMode === 'voice' ? 'Ảnh kèm theo (không bắt buộc)' : 'Ảnh (không bắt buộc)'}</Text>
+                <View style={s.mediaActions}>
+                  <Pressable onPress={() => choosePhoto(true)} style={({ pressed }) => [s.mediaButton, { backgroundColor: colors.surfaceAlt, borderColor: colors.line, opacity: pressed ? 0.75 : 1 }]}><Text style={{ color: colors.ink, fontSize: 12, fontWeight: '600' }}>▧  Chụp ảnh</Text></Pressable>
+                  <Pressable onPress={() => choosePhoto(false)} style={({ pressed }) => [s.mediaButton, { backgroundColor: colors.surfaceAlt, borderColor: colors.line, opacity: pressed ? 0.75 : 1 }]}><Text style={{ color: colors.ink, fontSize: 12, fontWeight: '600' }}>▤  Thư viện</Text></Pressable>
+                </View>
+                {!!draft.imageUris.length && <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 9, paddingVertical: 10 }}>{draft.imageUris.map((uri) => <View key={uri} style={{ position: 'relative' }}><MediaImage uri={uri} style={s.preview} /><Pressable onPress={() => setDraft((current) => ({ ...current, imageUris: current.imageUris.filter((value) => value !== uri) }))} style={s.removePhoto}><Text style={{ color: '#FFFFFF', fontWeight: '600' }}>×</Text></Pressable></View>)}</ScrollView>}
               </>}
               {composerMode === 'voice' && <View style={s.voiceControls}>
                 <Pressable accessibilityRole="button" accessibilityLabel={recorderState.isRecording ? 'Dừng và lưu ghi âm' : 'Bắt đầu ghi âm'} onPress={record} style={({ pressed }) => [s.voiceRecordButton, { backgroundColor: recorderState.isRecording ? '#C84535' : colors.primary, opacity: pressed ? 0.82 : 1 }]}>
@@ -555,12 +709,33 @@ export default function HomeScreen() {
                   <Text style={s.voiceRecordLabel}>{recorderState.isRecording ? 'Dừng và lưu' : 'Bắt đầu ghi âm'}</Text>
                 </Pressable>
                 <Text style={[s.sectionCaption, { color: colors.muted, textAlign: 'center' }]}>{recorderState.isRecording ? transcribing ? 'Đang ghi và chuyển giọng nói thành chữ…' : 'Đang ghi âm…' : 'Bản ghi âm và phần chữ sẽ tự lưu khi dừng.'}</Text>
+                {voiceSaveError && <Pressable onPress={() => finishVoiceNoteRef.current?.()} style={[s.retrySave, { backgroundColor: colors.surfaceAlt, borderColor: colors.line }]}><Text style={{ color: colors.ink, fontWeight: '700' }}>Thử lưu lại</Text></Pressable>}
               </View>}
               {!!audioUri && composerMode !== 'voice' && <View style={s.pills}><AudioPlayback uri={audioUri} palette={colors} />{composerMode === 'note' && <Text style={{ color: colors.green, fontSize: 10 }}>Có bản ghi âm</Text>}</View>}
-              <View style={s.actions}>{editing && <Pressable onPress={removeEntry} style={[s.delete, { borderColor: colors.line }]}><Text style={{ color: colors.primaryDark }}>Xóa mục</Text></Pressable>}<View style={{ flex: 1 }} />{composerMode !== 'voice' && <><Pressable onPress={closeComposer} style={[s.cancel, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink }}>Để sau</Text></Pressable><Pressable onPress={save} style={[s.save, { backgroundColor: colors.primary }]}><Text style={{ color: '#FFFFFF', fontWeight: '600' }}>{composerMode === 'note' ? 'Lưu ghi chú' : 'Lưu lại ✿'}</Text></Pressable></>}</View>
+              <View style={s.actions}>{editing && <Pressable onPress={() => { void removeEntry(); }} style={[s.delete, { borderColor: colors.line }]}><Text style={{ color: colors.primaryDark }}>Xóa mục</Text></Pressable>}<View style={{ flex: 1 }} />{composerMode !== 'voice' && <><Pressable onPress={closeComposer} style={[s.cancel, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink }}>Để sau</Text></Pressable><Pressable onPress={() => { void save(); }} style={[s.save, { backgroundColor: colors.primary }]}><Text style={{ color: '#FFFFFF', fontWeight: '600' }}>{composerMode === 'note' ? 'Lưu ghi chú' : composerMode === 'event' ? 'Lưu sự kiện' : 'Lưu lại ✿'}</Text></Pressable></>}</View>
             </ScrollView>
           </View>
         </KeyboardAvoidingView>
+      </Modal>
+      <Modal visible={!!eventDetail} animationType="slide" transparent onRequestClose={() => setEventDetail(null)}>
+        <View style={s.overlay}>
+          <Pressable style={StyleSheet.absoluteFill} onPress={() => setEventDetail(null)} />
+          <View style={[s.sheet, { backgroundColor: colors.paper, maxWidth: tablet ? 620 : 600 }]}>
+            {eventDetail && <>
+              <View style={[s.handle, { backgroundColor: colors.line }]} />
+              <View style={s.sheetHead}><View><Text style={[s.sectionCaption, { color: colors.primaryDark }]}>{eventDetail.googleEventId ? 'ĐỒNG BỘ GOOGLE CALENDAR' : 'SỰ KIỆN CỦA BẠN'}</Text><Text style={[s.sheetTitle, { color: colors.ink }]}>{eventDetail.title}</Text></View><Pressable onPress={() => setEventDetail(null)} style={[s.close, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink, fontSize: 20 }}>×</Text></Pressable></View>
+              <View style={[s.eventDetailCard, { backgroundColor: colors.surface, borderColor: colors.line }]}>
+                <Text style={[s.eventDetailDate, { color: colors.primaryDark }]}>{eventDetail.dueAt ? new Date(eventDetail.dueAt).toLocaleDateString('vi-VN', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }) : 'Chưa đặt ngày'}</Text>
+                <Text style={[s.eventDetailTime, { color: colors.ink }]}>{eventDetail.dueAt ? when(eventDetail.dueAt) : ''}</Text>
+                {!!eventDetail.body && <Text style={[s.eventDetailBody, { color: colors.muted }]}>{eventDetail.body}</Text>}
+              </View>
+              <View style={s.eventDetailActions}>
+                <Pressable onPress={() => { const item = eventDetail; setEventDetail(null); begin('event', item, 'event'); }} style={[s.eventDetailButton, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink, fontWeight: '600' }}>Chỉnh sửa</Text></Pressable>
+                <Pressable onPress={() => { void removeEntry(eventDetail.id); }} style={[s.eventDetailButton, { backgroundColor: '#B83A32' }]}><Text style={{ color: '#FFFFFF', fontWeight: '700' }}>Xóa sự kiện</Text></Pressable>
+              </View>
+            </>}
+          </View>
+        </View>
       </Modal>
     </SafeAreaView>
   );
@@ -626,7 +801,7 @@ function EntryRow({ item, palette, onOpen, onToggle, compact, petIcon }: { item:
     wasDone.current = done;
   }, [done, petScale, petTilt, bloom]);
   const details = when(item.dueAt);
-  return <Pressable onPress={onOpen} style={({ pressed }) => [s.entry, compact && s.entryCompact, { backgroundColor: palette.surface, borderColor: palette.line, opacity: pressed ? 0.84 : 1 }]}>
+  return <Pressable onPress={onOpen} style={({ pressed }) => [s.entry, compact && s.entryCompact, { backgroundColor: done ? palette.surfaceAlt : palette.surface, borderColor: palette.line, opacity: done ? 0.56 : pressed ? 0.84 : 1 }]}>
     {item.kind !== 'note' && <Pressable onPress={(event) => { event.stopPropagation(); onToggle(); }} accessibilityRole="checkbox" accessibilityState={{ checked: done }} hitSlop={6} style={[s.check, { borderColor: done ? palette.green : palette.line, backgroundColor: done ? palette.green : 'transparent' }]}><Text style={{ color: '#FFFFFF', fontSize: 17, fontWeight: '700' }}>{done ? '✓' : ''}</Text></Pressable>}
     <View style={{ flex: 1 }}><View style={s.entryHeadline}><Text numberOfLines={1} style={[s.entryTitle, { color: done ? palette.muted : palette.ink, textDecorationLine: done ? 'line-through' : 'none' }]}>{item.title}</Text><Text style={[s.badge, { backgroundColor: palette.surfaceAlt, color: palette.ink }]}>{KIND_ICON[item.kind]} {KIND_LABEL[item.kind]}</Text></View>
       {!!item.body && <Text numberOfLines={2} style={[s.entryBody, { color: palette.muted }]}>{item.body}</Text>}{!!details && <Text style={[s.meta, { color: palette.muted }]}>{details}</Text>}{!!item.imageUris.length && <Text style={[s.meta, { color: palette.primaryDark }]}>▧ {item.imageUris.length} ảnh</Text>}</View>
@@ -652,6 +827,32 @@ function QuickActions({ palette, onRecord, onAdd, addLabel }: { palette: (typeof
       <Text numberOfLines={1} style={[s.quickActionLabel, { color: '#FFFFFF' }]}>{addLabel}</Text>
     </Pressable>
   </View>;
+}
+function CalendarGrid({ dates, focus, mode, entries, palette, onSelect }: { dates: Date[]; focus: Date; mode: CalendarViewMode; entries: Entry[]; palette: (typeof palettes)[ThemeName]; onSelect: (date: Date) => void }) {
+  const weekdayLabels = ['T2', 'T3', 'T4', 'T5', 'T6', 'T7', 'CN'];
+  const focusedKey = localDayKey(focus);
+  const eventDays = new Set(entries.filter((entry) => entry.dueAt).map((entry) => localDayKey(new Date(entry.dueAt!))));
+  return <View style={[s.calendarGridWrap, { backgroundColor: palette.surface, borderColor: palette.line }]}>
+    {mode !== 'day' && <View style={s.calendarWeekdays}>{weekdayLabels.map((label) => <Text key={label} style={[s.calendarWeekday, { color: palette.muted }]}>{label}</Text>)}</View>}
+    <View style={s.calendarGrid}>{dates.map((date) => {
+      const key = localDayKey(date);
+      const selected = key === focusedKey;
+      const isCurrentMonth = date.getMonth() === focus.getMonth();
+      const hasEvents = eventDays.has(key);
+      return <Pressable key={key} accessibilityRole="button" accessibilityLabel={date.toLocaleDateString('vi-VN')} onPress={() => onSelect(date)} style={[s.calendarCell, { width: mode === 'day' ? '100%' : '14.28%', minHeight: mode === 'day' ? 48 : 39 }]}>
+        <View style={[s.calendarDateBubble, selected && { backgroundColor: palette.primary }]}><Text style={{ color: selected ? (palette.name === 'Thế Anh & Nho' ? '#071719' : '#FFFFFF') : isCurrentMonth || mode !== 'month' ? palette.ink : palette.muted, opacity: isCurrentMonth || mode !== 'month' ? 1 : 0.45, fontSize: mode === 'day' ? 15 : 12, fontWeight: selected ? '700' : '500' }}>{mode === 'day' ? date.toLocaleDateString('vi-VN', { day: 'numeric', month: 'long' }) : date.getDate()}</Text></View>
+        {hasEvents && <View style={[s.calendarEventDot, { backgroundColor: selected ? palette.primary : palette.accent }]} />}
+      </Pressable>;
+    })}</View>
+  </View>;
+}
+function EventRow({ item, palette, petIcon, onPress }: { item: Entry; palette: (typeof palettes)[ThemeName]; petIcon: number; onPress: () => void }) {
+  const date = item.dueAt ? new Date(item.dueAt) : undefined;
+  return <Pressable onPress={onPress} style={({ pressed }) => [s.eventRow, { backgroundColor: palette.surface, borderColor: palette.line, opacity: pressed ? 0.78 : 1 }]}>
+    <View style={[s.eventDateBadge, { backgroundColor: palette.surfaceAlt }]}><Text style={{ color: palette.primaryDark, fontSize: 10, fontWeight: '700' }}>{date?.toLocaleDateString('vi-VN', { day: 'numeric', month: 'short' }) || '—'}</Text><Text style={{ color: palette.muted, fontSize: 9 }}>{when(item.dueAt)}</Text></View>
+    <View style={{ flex: 1 }}><Text style={[s.entryTitle, { color: palette.ink }]} numberOfLines={2}>{item.title}</Text>{!!item.body && <Text style={[s.entryBody, { color: palette.muted }]} numberOfLines={2}>{item.body}</Text>}</View>
+    <Image source={petIcon} style={s.entryPet} resizeMode="contain" />
+  </Pressable>;
 }
 type NavGlyphKind = 'home' | 'notes' | 'calendar' | 'settings';
 function NavGlyph({ kind, color, active, palette }: { kind: NavGlyphKind; color: string; active: boolean; palette: (typeof palettes)[ThemeName] }) {
@@ -714,6 +915,9 @@ const s = StyleSheet.create({
   noteTitle: { fontSize: 14, fontWeight: '600', lineHeight: 19 }, noteBody: { fontSize: 12, lineHeight: 17, marginTop: 4 }, noteDate: { fontSize: 9, marginTop: 8 },
   calendarBanner: { flexDirection: 'row', alignItems: 'center', gap: 12, padding: 14, borderRadius: 17, marginVertical: 17 },
   calendarTabs: { flexDirection: 'row', gap: 5, padding: 4, borderRadius: 14, marginBottom: 14 }, calendarTab: { flex: 1, minHeight: 38, borderWidth: 1, borderRadius: 11, alignItems: 'center', justifyContent: 'center' },
+  calendarTitleRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginTop: 17, marginBottom: 10 }, calendarArrow: { width: 37, height: 37, borderRadius: 13, alignItems: 'center', justifyContent: 'center' }, calendarHeading: { flex: 1, textAlign: 'center', fontSize: 17, fontWeight: '700', textTransform: 'capitalize' }, calendarModes: { flexDirection: 'row', padding: 4, gap: 4, borderRadius: 13, marginBottom: 9 }, calendarMode: { flex: 1, minHeight: 34, borderWidth: 1, borderRadius: 10, alignItems: 'center', justifyContent: 'center' },
+  calendarGridWrap: { borderWidth: 1, borderRadius: 14, padding: 8, marginBottom: 14 }, calendarWeekdays: { flexDirection: 'row', marginBottom: 4 }, calendarWeekday: { width: '14.28%', textAlign: 'center', fontSize: 9, fontWeight: '600' }, calendarGrid: { flexDirection: 'row', flexWrap: 'wrap' }, calendarCell: { alignItems: 'center', justifyContent: 'center', gap: 2 }, calendarDateBubble: { minWidth: 25, minHeight: 25, paddingHorizontal: 6, borderRadius: 9, alignItems: 'center', justifyContent: 'center' }, calendarEventDot: { width: 4, height: 4, borderRadius: 2 },
+  eventRow: { minHeight: 74, borderWidth: 1, borderRadius: 16, padding: 10, marginBottom: 8, flexDirection: 'row', alignItems: 'center', gap: 10 }, eventDateBadge: { width: 54, minHeight: 48, borderRadius: 12, alignItems: 'center', justifyContent: 'center', gap: 3 }, eventDateFields: { flexDirection: 'row', gap: 8 }, eventDateInput: { flex: 1, marginBottom: 8 }, eventTimeInput: { width: 104, marginBottom: 8 }, eventDetailCard: { borderWidth: 1, borderRadius: 18, padding: 17, marginTop: 8 }, eventDetailDate: { fontSize: 14, fontWeight: '600', textTransform: 'capitalize' }, eventDetailTime: { fontSize: 27, fontWeight: '700', marginTop: 7 }, eventDetailBody: { fontSize: 14, lineHeight: 21, marginTop: 14 }, eventDetailActions: { flexDirection: 'row', gap: 9, marginTop: 17 }, eventDetailButton: { flex: 1, minHeight: 45, borderRadius: 14, alignItems: 'center', justifyContent: 'center' },
   integration: { borderWidth: 1, borderRadius: 15, flexDirection: 'row', alignItems: 'center', gap: 10, padding: 12, marginTop: 12 },
   integrationTitle: { fontSize: 11, fontWeight: '600' }, integrationSub: { fontSize: 9, marginTop: 3 },
   themeChoice: { flexDirection: 'row', alignItems: 'center', gap: 11, borderWidth: 1.5, borderRadius: 16, padding: 11 },
@@ -730,6 +934,6 @@ const s = StyleSheet.create({
   voiceTranscript: { minHeight: 165, fontSize: 16, lineHeight: 24, padding: 15 }, voiceControls: { alignItems: 'center', gap: 11, marginTop: 18 }, voiceRecordButton: { width: '100%', minHeight: 76, borderRadius: 20, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 12 }, voiceRecordLabel: { color: '#FFFFFF', fontSize: 17, fontWeight: '700' },
   color: { width: 25, height: 25, borderRadius: 13, borderWidth: 2, marginRight: 7 }, button: { borderRadius: 11, paddingHorizontal: 11, paddingVertical: 9, alignItems: 'center', justifyContent: 'center' },
   preview: { width: 84, height: 76, borderRadius: 9 }, removePhoto: { position: 'absolute', top: 4, right: 4, width: 21, height: 21, borderRadius: 11, backgroundColor: '#4C403ACC', justifyContent: 'center', alignItems: 'center' },
-  actions: { flexDirection: 'row', alignItems: 'center', gap: 7, marginTop: 18 }, delete: { borderWidth: 1, borderRadius: 11, paddingVertical: 10, paddingHorizontal: 11 },
+  actions: { flexDirection: 'row', alignItems: 'center', gap: 7, marginTop: 18 }, delete: { borderWidth: 1, borderRadius: 11, paddingVertical: 10, paddingHorizontal: 11 }, mediaActions: { flexDirection: 'row', gap: 8 }, mediaButton: { flex: 1, minHeight: 43, borderWidth: 1, borderRadius: 13, justifyContent: 'center', alignItems: 'center' }, retrySave: { paddingHorizontal: 18, paddingVertical: 11, borderRadius: 14, borderWidth: 1 },
   cancel: { borderRadius: 11, paddingVertical: 10, paddingHorizontal: 13 }, save: { borderRadius: 11, paddingVertical: 10, paddingHorizontal: 16 },
 });

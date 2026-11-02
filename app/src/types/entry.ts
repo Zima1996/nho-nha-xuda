@@ -11,6 +11,7 @@ export type Entry = {
   priority: Priority;
   color: string;
   dueAt?: string;
+  endAt?: string;
   reminderAt?: string;
   reminderChoice?: 'hour' | 'evening' | 'tomorrow';
   notificationId?: string;

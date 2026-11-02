@@ -84,6 +84,18 @@ export async function getGoogleAccountEmail(token: string): Promise<string> {
   return profile.email || '';
 }
 
+export async function deleteGoogleCalendarEvent(token: string, eventId: string): Promise<void> {
+  const response = await fetch(`${CALENDAR_API}/calendars/primary/events/${encodeURIComponent(eventId)}`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!response.ok && response.status !== 410) {
+    let message = `Google Calendar báo lỗi (${response.status}).`;
+    try { const result = await response.json() as { error?: { message?: string } }; message = result.error?.message || message; } catch { /* Keep the status message. */ }
+    throw new Error(message);
+  }
+}
+
 function startDate(event: GoogleEvent): string | undefined {
   if (event.start?.dateTime) return event.start.dateTime;
   if (event.start?.date) return new Date(`${event.start.date}T09:00:00`).toISOString();
@@ -92,7 +104,7 @@ function startDate(event: GoogleEvent): string | undefined {
 
 function toGoogleEvent(entry: Entry) {
   const start = new Date(entry.dueAt!);
-  const end = new Date(start.getTime() + 30 * 60 * 1000);
+  const end = entry.endAt ? new Date(entry.endAt) : new Date(start.getTime() + 30 * 60 * 1000);
   return {
     summary: entry.title,
     description: entry.body || undefined,
@@ -100,6 +112,13 @@ function toGoogleEvent(entry: Entry) {
     end: { dateTime: end.toISOString() },
     extendedProperties: { private: { nhoNhaEntryId: entry.id } },
   };
+}
+
+export async function updateGoogleCalendarEvent(token: string, entry: Entry): Promise<void> {
+  if (!entry.googleEventId || !entry.dueAt) return;
+  await googleFetch<GoogleEvent>(token, `/calendars/primary/events/${encodeURIComponent(entry.googleEventId)}`, {
+    method: 'PATCH', body: JSON.stringify(toGoogleEvent(entry)),
+  });
 }
 
 export async function syncGoogleCalendar(token: string, entries: Entry[]): Promise<{ entries: Entry[]; imported: number; uploaded: number }> {
@@ -117,7 +136,12 @@ export async function syncGoogleCalendar(token: string, entries: Entry[]): Promi
     pageToken = result.nextPageToken;
   } while (pageToken);
 
-  let nextEntries = [...entries];
+  const remoteIds = new Set(calendarEvents.map((event) => event.id));
+  let nextEntries = entries.filter((entry) => {
+    if (entry.kind !== 'event' || !entry.googleEventId || !entry.dueAt) return true;
+    const eventDay = new Date(entry.dueAt).getTime();
+    return eventDay < min.getTime() || eventDay > max.getTime() || remoteIds.has(entry.googleEventId);
+  });
   let imported = 0;
   for (const event of calendarEvents) {
     const dueAt = startDate(event);
@@ -129,6 +153,7 @@ export async function syncGoogleCalendar(token: string, entries: Entry[]): Promi
         title: event.summary || entry.title,
         body: event.description ?? entry.body,
         dueAt,
+        endAt: event.end?.dateTime || (event.end?.date ? new Date(`${event.end.date}T09:30:00`).toISOString() : entry.endAt),
         googleEventId: event.id,
       } : entry);
     } else {
@@ -142,6 +167,7 @@ export async function syncGoogleCalendar(token: string, entries: Entry[]): Promi
         priority: 'normal',
         color: '#8FA28A',
         dueAt,
+        endAt: event.end?.dateTime || (event.end?.date ? new Date(`${event.end.date}T09:30:00`).toISOString() : undefined),
         imageUris: [],
         createdAt: new Date().toISOString(),
       });
