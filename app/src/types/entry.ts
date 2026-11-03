@@ -20,6 +20,7 @@ export type Entry = {
   audioUri?: string;
   transcript?: string;
   googleEventId?: string;
+  noteLocation?: 'today' | 'calendar';
   dayKey?: string;
   createdAt: string;
 };

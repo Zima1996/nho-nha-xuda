@@ -3,6 +3,7 @@ import * as Notifications from 'expo-notifications';
 import type { AppData, Entry } from '@/types/entry';
 
 const DATA_KEY = 'nho-nha.data.v1';
+const THEME_KEY = 'nho-nha.theme.v1';
 const now = new Date();
 export function localDayKey(date = new Date()): string {
   const year = date.getFullYear();
@@ -68,8 +69,10 @@ let saveQueue: Promise<void> = Promise.resolve();
 
 export async function loadAppData(): Promise<AppData> {
   const saved = await Storage.getItem(DATA_KEY);
+  const savedTheme = await Storage.getItem(THEME_KEY);
   if (!saved) {
-    const initial = { ...starterData, todayKey: localDayKey() };
+    const validThemes = ['energy', 'nature', 'the-anh'];
+    const initial = { ...starterData, theme: validThemes.includes(savedTheme || '') ? savedTheme as AppData['theme'] : starterData.theme, todayKey: localDayKey() };
     await saveAppData(initial);
     return initial;
   }
@@ -77,9 +80,11 @@ export async function loadAppData(): Promise<AppData> {
   const parsed = JSON.parse(saved) as Partial<AppData>;
   if (!Array.isArray(parsed.entries)) throw new Error('Saved app data is missing its entries list.');
   const validThemes = ['energy', 'nature', 'the-anh'];
-  const theme = validThemes.includes(parsed.theme as string)
-    ? parsed.theme as AppData['theme']
-    : ['peach', 'nho'].includes(parsed.theme as string) ? 'the-anh' : starterData.theme;
+  const theme = validThemes.includes(savedTheme || '')
+    ? savedTheme as AppData['theme']
+    : validThemes.includes(parsed.theme as string)
+      ? parsed.theme as AppData['theme']
+      : ['peach', 'nho'].includes(parsed.theme as string) ? 'the-anh' : starterData.theme;
   const entries = parsed.entries.map((entry) => ({
     ...entry,
     imageUris: Array.isArray(entry.imageUris) ? entry.imageUris : [],
@@ -100,9 +105,17 @@ export async function loadAppData(): Promise<AppData> {
 }
 
 export async function saveAppData(data: AppData): Promise<void> {
-  const serialized = JSON.stringify(data);
-  saveQueue = saveQueue.catch(() => undefined).then(() => Storage.setItem(DATA_KEY, serialized));
+  saveQueue = saveQueue.catch(() => undefined).then(async () => {
+    const savedTheme = await Storage.getItem(THEME_KEY);
+    const validThemes = ['energy', 'nature', 'the-anh'];
+    const nextData = validThemes.includes(savedTheme || '') ? { ...data, theme: savedTheme as AppData['theme'] } : data;
+    await Storage.setItem(DATA_KEY, JSON.stringify(nextData));
+  });
   await saveQueue;
+}
+
+export async function saveTheme(theme: AppData['theme']): Promise<void> {
+  await Storage.setItem(THEME_KEY, theme);
 }
 
 export function makeEntryId(): string {

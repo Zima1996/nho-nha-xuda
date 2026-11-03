@@ -12,7 +12,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { entryColorOptions, palettes } from '@/constants/palettes';
 import { AudioPlayback } from '@/components/AudioPlayback';
 import { MediaImage } from '@/components/MediaImage';
-import { loadAppData, localDayKey, rollOverDailyItems, saveAppData, starterData, updateEntries } from '@/data/local-store';
+import { loadAppData, localDayKey, rollOverDailyItems, saveAppData, saveTheme, starterData, updateEntries } from '@/data/local-store';
 import { saveMedia } from '@/data/media-store';
 import { deleteGoogleCalendarEvent, getGoogleAccountEmail, requestGoogleAccessToken, syncGoogleCalendar, updateGoogleCalendarEvent } from '@/services/google-calendar';
 import type { AppData, Entry, EntryKind, ThemeName } from '@/types/entry';
@@ -21,6 +21,7 @@ type Tab = 'today' | 'calendar' | 'settings';
 type CalendarSection = 'events' | 'notes';
 type CalendarViewMode = 'month' | 'week' | 'day';
 type ComposerMode = 'task' | 'note' | 'voice' | 'event';
+type NoteLocation = 'today' | 'calendar';
 type Draft = Omit<Entry, 'id' | 'createdAt'>;
 type BrowserSpeechResult = { transcript: string };
 type BrowserSpeechEvent = Event & { resultIndex: number; results: ArrayLike<ArrayLike<BrowserSpeechResult> & { isFinal: boolean }> };
@@ -33,6 +34,7 @@ type BrowserSpeechRecognition = {
   onend: (() => void) | null;
   start(): void;
   stop(): void;
+  abort?(): void;
 };
 type SpeechWindow = Window & { SpeechRecognition?: new () => BrowserSpeechRecognition; webkitSpeechRecognition?: new () => BrowserSpeechRecognition };
 const KIND_LABEL: Record<EntryKind, string> = { task: 'Task', event: 'Event', routine: 'Routine', note: 'Note' };
@@ -115,11 +117,11 @@ export default function HomeScreen() {
   const [editing, setEditing] = useState<string | null>(null);
   const [visible, setVisible] = useState(false);
   const [composerMode, setComposerMode] = useState<ComposerMode>('task');
+  const [noteLocation, setNoteLocation] = useState<NoteLocation>('today');
   const [draft, setDraft] = useState<Draft>(newDraft());
   const [eventDateText, setEventDateText] = useState('');
   const [eventTimeText, setEventTimeText] = useState('09:00');
   const [audioUri, setAudioUri] = useState<string>();
-  const [voiceSaveError, setVoiceSaveError] = useState(false);
   const [transcript, setTranscript] = useState('');
   const [transcribing, setTranscribing] = useState(false);
   const transcriptRef = useRef('');
@@ -127,10 +129,8 @@ export default function HomeScreen() {
   const contentBeforeTranscriptRef = useRef('');
   const browserRecognitionRef = useRef<BrowserSpeechRecognition | null>(null);
   const shouldRecognizeRef = useRef(false);
-  const autoSaveVoiceRef = useRef(false);
   const pendingVoiceAudioRef = useRef<string | undefined>(undefined);
   const browserRecognitionEndRef = useRef<(() => void) | null>(null);
-  const finishVoiceNoteRef = useRef<(() => void) | null>(null);
   const voiceSaveBusyRef = useRef(false);
   const recordingOptions = useMemo(() => {
     if (Platform.OS === 'ios') return {
@@ -139,11 +139,13 @@ export default function HomeScreen() {
       ios: { ...RecordingPresets.HIGH_QUALITY.ios, outputFormat: IOSOutputFormat.MPEGLAYER3 },
     };
     if (Platform.OS === 'web') {
+      const supportsMp3 = typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported('audio/mpeg');
       const supportsMp4 = typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported('audio/mp4');
+      const mimeType = supportsMp3 ? 'audio/mpeg' : supportsMp4 ? 'audio/mp4' : 'audio/webm';
       return {
         ...RecordingPresets.HIGH_QUALITY,
-        extension: supportsMp4 ? '.m4a' : '.webm',
-        web: { mimeType: supportsMp4 ? 'audio/mp4' : 'audio/webm', bitsPerSecond: 128_000 },
+        extension: supportsMp3 ? '.mp3' : supportsMp4 ? '.m4a' : '.webm',
+        web: { mimeType, bitsPerSecond: 128_000 },
       };
     }
     return RecordingPresets.HIGH_QUALITY;
@@ -153,6 +155,10 @@ export default function HomeScreen() {
   const tablet = width >= 760;
   const colors = palettes[data.theme];
   const copy = themeCopy[data.theme];
+  useEffect(() => {
+    if (Platform.OS !== 'web' || typeof document === 'undefined') return;
+    document.querySelector('meta[name="theme-color"]')?.setAttribute('content', colors.paper);
+  }, [colors.paper]);
 
   useSpeechRecognitionEvent('result', (event) => {
     const value = event.results?.[0]?.transcript;
@@ -175,7 +181,6 @@ export default function HomeScreen() {
   });
   useSpeechRecognitionEvent('end', () => {
     setTranscribing(false);
-    if (autoSaveVoiceRef.current) finishVoiceNoteRef.current?.();
   });
 
   useEffect(() => {
@@ -212,10 +217,10 @@ export default function HomeScreen() {
 
   const list = useMemo(() => {
     let result = data.entries;
-    if (tab === 'today') result = result.filter((item) => (item.kind === 'task' || item.kind === 'routine') && (!item.dayKey || item.dayKey <= todayKey));
+    if (tab === 'today') result = result.filter((item) => ((item.kind === 'task' || item.kind === 'routine') && (!item.dayKey || item.dayKey <= todayKey)) || (item.kind === 'note' && item.noteLocation === 'today'));
     if (tab === 'calendar') result = result.filter((item) => calendarSection === 'events'
       ? item.kind === 'event' && !!item.dueAt && localDayKey(new Date(item.dueAt)) === localDayKey(calendarFocus)
-      : item.kind === 'note');
+      : item.kind === 'note' && (item.noteLocation || 'calendar') === 'calendar');
     if (query.trim()) {
       const needle = query.trim().toLocaleLowerCase('vi');
       result = result.filter((item) => (item.title + ' ' + item.body + ' ' + (item.transcript || '')).toLocaleLowerCase('vi').includes(needle));
@@ -233,9 +238,10 @@ export default function HomeScreen() {
     });
   }
 
-  function begin(kindValue: EntryKind = 'task', item?: Entry, mode?: ComposerMode) {
+  function begin(kindValue: EntryKind = 'task', item?: Entry, mode?: ComposerMode, location?: NoteLocation) {
     setEditing(item?.id || null);
     setComposerMode(mode || (kindValue === 'note' ? 'note' : kindValue === 'event' ? 'event' : 'task'));
+    if (kindValue === 'note') setNoteLocation(item?.noteLocation || location || 'calendar');
     if (item) {
       const { id: _id, createdAt: _created, ...rest } = item;
       setDraft({ ...rest, imageUris: [...item.imageUris] });
@@ -258,22 +264,18 @@ export default function HomeScreen() {
     transcriptRef.current = item?.transcript || '';
     setVisible(true);
   }
-  function beginVoiceNote() {
-    autoSaveVoiceRef.current = true;
+  function beginVoiceNote(location: NoteLocation) {
     voiceSaveBusyRef.current = false;
-    setVoiceSaveError(false);
     pendingVoiceAudioRef.current = undefined;
-    begin('note', undefined, 'voice');
+    begin('note', undefined, 'voice', location);
   }
-  function beginQuickNote(item?: Entry) {
-    autoSaveVoiceRef.current = false;
+  function beginQuickNote(location: NoteLocation, item?: Entry) {
     pendingVoiceAudioRef.current = undefined;
-    begin('note', item, 'note');
+    begin('note', item, 'note', location);
   }
   async function chooseTheme(theme: ThemeName) {
-    const nextData = { ...data, theme };
-    setData(nextData);
-    try { await saveAppData(nextData); }
+    setData((current) => ({ ...current, theme }));
+    try { await saveTheme(theme); await saveAppData({ ...data, theme }); }
     catch { Alert.alert('Chưa lưu được màu sắc', 'Theme đã đổi tạm thời. Hãy thử lại sau khi thiết bị hoạt động bình thường.'); }
   }
   function put(item: Entry) {
@@ -289,9 +291,9 @@ export default function HomeScreen() {
     setData(nextData);
     await saveAppData(nextData);
   }
-  async function finishVoiceNote() {
-    const audio = pendingVoiceAudioRef.current;
-    if (!audio || !autoSaveVoiceRef.current || voiceSaveBusyRef.current) return;
+  async function saveVoiceNote() {
+    const audio = audioUri || pendingVoiceAudioRef.current;
+    if (!audio || voiceSaveBusyRef.current) return;
     voiceSaveBusyRef.current = true;
     const body = draft.body.trim() || transcriptRef.current.trim();
     const now = new Date();
@@ -299,6 +301,7 @@ export default function HomeScreen() {
     const item: Entry = {
       ...newDraft('note'),
       id: data.entries.find((entry) => entry.kind === 'note' && entry.audioUri === audio)?.id || id(),
+      noteLocation,
       title,
       body,
       transcript: body,
@@ -308,20 +311,16 @@ export default function HomeScreen() {
     };
     try {
       await persistEntry(item);
-      autoSaveVoiceRef.current = false;
       pendingVoiceAudioRef.current = undefined;
-      setVoiceSaveError(false);
       setVisible(false);
       setTranscribing(false);
-      Alert.alert('Đã lưu ghi âm', 'Bản ghi, phần chữ và ảnh đã được lưu trong Ghi chú ở tab Lịch.');
+      Alert.alert('Đã lưu ghi âm', noteLocation === 'today' ? 'Bản ghi đã nằm trong Hôm nay.' : 'Bản ghi đã nằm trong Ghi chú của tab Lịch.');
     } catch {
-      setVoiceSaveError(true);
-      Alert.alert('Chưa lưu được ghi âm', 'Bản ghi vẫn đang mở. Hãy chạm “Thử lưu lại” để lưu lần nữa.');
+      Alert.alert('Chưa lưu được ghi âm', 'Bản ghi vẫn đang mở. Kiểm tra dung lượng thiết bị rồi chạm Lưu lại.');
     } finally {
       voiceSaveBusyRef.current = false;
     }
   }
-  finishVoiceNoteRef.current = () => { void finishVoiceNote(); };
   async function connectGoogle() {
     const clientId = process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID;
     if (!clientId) {
@@ -396,6 +395,7 @@ export default function HomeScreen() {
     const item: Entry = {
       ...draft, title, id: editing || id(), createdAt: previous?.createdAt || new Date().toISOString(),
       audioUri: audioUri || draft.audioUri, transcript: transcript || draft.transcript,
+      ...(draft.kind === 'note' ? { noteLocation } : {}),
       ...((draft.kind === 'task' || draft.kind === 'routine') ? { dayKey: previous?.dayKey || todayKey } : {}),
       ...(draft.kind === 'event' ? { dueAt: eventDueAt, endAt: previous?.endAt || (eventDueAt ? new Date(new Date(eventDueAt).getTime() + 30 * 60_000).toISOString() : undefined) } : {}),
     };
@@ -486,9 +486,19 @@ export default function HomeScreen() {
       await record();
       return;
     }
-    autoSaveVoiceRef.current = false;
     pendingVoiceAudioRef.current = undefined;
     setVisible(false);
+  }
+  async function retakeVoice() {
+    if (recorderState.isRecording) { await record(); return; }
+    shouldRecognizeRef.current = false;
+    browserRecognitionRef.current?.abort?.();
+    setAudioUri(undefined);
+    pendingVoiceAudioRef.current = undefined;
+    transcriptRef.current = ''; partialRef.current = ''; contentBeforeTranscriptRef.current = '';
+    setTranscript(''); setTranscribing(false);
+    setDraft((current) => ({ ...current, body: '', audioUri: undefined }));
+    await record();
   }
   async function record() {
     try {
@@ -501,8 +511,7 @@ export default function HomeScreen() {
           setAudioUri(uri); setDraft((value) => ({ ...value, audioUri: uri }));
           if (composerMode === 'voice') {
             pendingVoiceAudioRef.current = uri;
-            if (Platform.OS === 'web') finishVoiceNoteRef.current?.();
-            else transcribe(uri);
+            if (Platform.OS !== 'web') transcribe(uri);
           }
         }
       } else {
@@ -554,7 +563,7 @@ export default function HomeScreen() {
       };
       browserRecognitionRef.current = recognition;
       shouldRecognizeRef.current = true;
-      contentBeforeTranscriptRef.current = draft.body.trim();
+      contentBeforeTranscriptRef.current = composerMode === 'voice' ? '' : draft.body.trim();
       transcriptRef.current = ''; partialRef.current = ''; setTranscript(''); setTranscribing(true);
       recognition.start();
     } catch {
@@ -573,7 +582,6 @@ export default function HomeScreen() {
       const permission = await ExpoSpeechRecognitionModule.requestPermissionsAsync();
       if (!permission.granted) {
         Alert.alert('Chưa có quyền nhận dạng giọng nói', 'Bản ghi âm vẫn được lưu; bạn có thể bật quyền nhận dạng giọng nói trong Cài đặt.');
-        if (autoSaveVoiceRef.current) finishVoiceNoteRef.current?.();
         return;
       }
       contentBeforeTranscriptRef.current = transcript && draft.body.endsWith(transcript)
@@ -590,7 +598,6 @@ export default function HomeScreen() {
     } catch {
       setTranscribing(false);
       Alert.alert('Chưa chuyển được thành chữ', 'Bản ghi âm vẫn được giữ lại để bạn nghe sau.');
-      if (autoSaveVoiceRef.current) finishVoiceNoteRef.current?.();
     }
   }
   const total = data.entries.filter((entry) => (entry.kind === 'task' || entry.kind === 'routine') && (!entry.dayKey || entry.dayKey <= todayKey)).length;
@@ -619,13 +626,13 @@ export default function HomeScreen() {
                 <Text style={[s.progressNumber, { color: colors.primary }]}>{total ? Math.round(done / total * 100) : 0}%</Text></View>
               <View style={[s.progressTrack, { backgroundColor: colors.line }]}><View style={[s.progressFill, { width: `${total ? Math.round(done / total * 100) : 0}%`, backgroundColor: colors.primary }]} /></View>
             </View>
-            <View style={s.sectionTop}><Text style={[s.sectionTitle, { color: colors.ink }]}>Việc cần nhớ</Text><QuickActions palette={colors} onRecord={beginVoiceNote} onAdd={() => beginQuickNote()} addLabel="Ghi chú" /></View>
+            <View style={s.sectionTop}><Text style={[s.sectionTitle, { color: colors.ink }]}>Việc cần nhớ</Text><QuickActions palette={colors} onRecord={() => beginVoiceNote('today')} onAdd={() => beginQuickNote('today')} addLabel="Ghi chú" /></View>
             <Search value={query} onChange={setQuery} palette={colors} />
             <View style={s.listHead}><Text style={[s.dayLabel, { color: colors.muted }]}>HÔM NAY · {list.length} MỤC</Text><Text style={[s.handText, { color: colors.primaryDark }]}>{copy.nudge}</Text></View>
-            {list.length ? <View style={tablet ? s.grid : undefined}>{list.map((item) => <EntryRow key={item.id} item={item} palette={colors} petIcon={petFor(item.id, petSeed)} compact={tablet} onOpen={() => begin(item.kind, item)} onToggle={() => put({ ...item, status: item.status === 'done' ? 'todo' : 'done' })} />)}</View> : <View style={[s.empty, { backgroundColor: colors.surface, borderColor: colors.line }]}><Image source={petFor('empty-today', petSeed)} style={s.emptyPet} /><Text style={[s.sectionTitle, { color: colors.ink }]}>Chưa có gì ở đây</Text><Text style={[s.subtitle, { color: colors.muted }]}>{copy.empty}</Text><Button label="＋ Ghi chú" primary palette={colors} onPress={() => beginQuickNote()} /></View>}
+            {list.length ? <View style={tablet ? s.grid : undefined}>{list.map((item) => <EntryRow key={item.id} item={item} palette={colors} petIcon={petFor(item.id, petSeed)} compact={tablet} onOpen={() => item.kind === 'note' ? beginQuickNote('today', item) : begin(item.kind, item)} onToggle={() => put({ ...item, status: item.status === 'done' ? 'todo' : 'done' })} />)}</View> : <View style={[s.empty, { backgroundColor: colors.surface, borderColor: colors.line }]}><Image source={petFor('empty-today', petSeed)} style={s.emptyPet} /><Text style={[s.sectionTitle, { color: colors.ink }]}>Chưa có gì ở đây</Text><Text style={[s.subtitle, { color: colors.muted }]}>{copy.empty}</Text><Button label="＋ Ghi chú" primary palette={colors} onPress={() => beginQuickNote('today')} /></View>}
           </>}
           {tab === 'calendar' && <>
-            <View style={s.sectionTop}><Text style={[s.sectionTitle, { color: colors.ink }]}>Lịch</Text><QuickActions palette={colors} onRecord={beginVoiceNote} onAdd={() => beginQuickNote()} addLabel="Ghi chú" /></View>
+            <View style={s.sectionTop}><Text style={[s.sectionTitle, { color: colors.ink }]}>Lịch</Text><QuickActions palette={colors} onRecord={() => beginVoiceNote('calendar')} onAdd={() => beginQuickNote('calendar')} addLabel="Ghi chú" /></View>
             <Text style={[s.title, { color: colors.ink }]}>{calendarSection === 'events' ? 'Lịch sự kiện' : 'Ghi chú đã lưu'} <Text style={{ color: colors.primary }}>{calendarSection === 'events' ? '☁' : '✎'}</Text></Text>
             <Text style={[s.subtitle, { color: colors.muted }]}>{calendarSection === 'events' ? 'Các sự kiện dài hạn từ app và Google Calendar.' : 'Ảnh, chữ và bản ghi âm được giữ lại lâu dài.'}</Text>
             <View style={[s.calendarTabs, { backgroundColor: colors.surfaceAlt }]}>
@@ -642,15 +649,8 @@ export default function HomeScreen() {
               {list.map((item) => <EventRow key={item.id} item={item} palette={colors} petIcon={petFor(item.id, petSeed)} onPress={() => setEventDetail(item)} />)}
               {!list.length && <Empty palette={colors} emoji="☕" petIcon={petFor('empty-calendar', petSeed)} title="Chưa có sự kiện sắp tới" label="Đồng bộ Google Calendar" onPress={() => syncCalendar()} />}
             </> : <>
-              <View style={[s.noteGrid, { gap: 10 }]}>{list.map((item, index) => <Pressable key={item.id} onPress={() => beginQuickNote(item)} style={[s.note, { backgroundColor: index % 2 ? colors.surfaceAlt : colors.surface, borderColor: colors.line, width: tablet ? '31.5%' : '48%', transform: [{ rotate: index % 2 ? '0.5deg' : '-0.5deg' }] }]}>
-                {item.imageUris[0] ? <MediaImage uri={item.imageUris[0]} style={s.photo} /> : <View style={[s.photo, s.photoPlaceholder, { backgroundColor: colors.surfaceAlt }]}><Image source={petFor(item.id, petSeed)} style={s.placeholderPet} /></View>}
-                <Text style={[s.noteTitle, { color: colors.ink }]} numberOfLines={2}>{item.title}</Text>
-                {!!item.body && <Text style={[s.noteBody, { color: colors.muted }]} numberOfLines={4}>{item.body}</Text>}
-                {!!item.imageUris.length && <Text style={[s.noteDate, { color: colors.primaryDark }]}>{item.imageUris.length} ảnh</Text>}
-                {item.audioUri && <View style={{ marginTop: 7 }}><AudioPlayback uri={item.audioUri} palette={colors} /></View>}
-                <Text style={[s.noteDate, { color: colors.muted }]}>{new Date(item.createdAt).toLocaleDateString('vi-VN')}</Text>
-              </Pressable>)}</View>
-              {!list.length && <Empty palette={colors} emoji="📔" petIcon={petFor('empty-notes', petSeed)} title="Chưa có ghi chú nào" label="＋ Ghi chú" onPress={() => beginQuickNote()} />}
+              <View style={{ gap: 8, marginTop: 4 }}>{list.map((item) => <NoteRow key={item.id} item={item} palette={colors} petIcon={petFor(item.id, petSeed)} onOpen={() => beginQuickNote('calendar', item)} onToggle={() => put({ ...item, status: item.status === 'done' ? 'todo' : 'done' })} />)}</View>
+              {!list.length && <Empty palette={colors} emoji="📔" petIcon={petFor('empty-notes', petSeed)} title="Chưa có ghi chú nào" label="＋ Ghi chú" onPress={() => beginQuickNote('calendar')} />}
             </>}
           </>}
           {tab === 'settings' && <>
@@ -704,15 +704,15 @@ export default function HomeScreen() {
                 {!!draft.imageUris.length && <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 9, paddingVertical: 10 }}>{draft.imageUris.map((uri) => <View key={uri} style={{ position: 'relative' }}><MediaImage uri={uri} style={s.preview} /><Pressable onPress={() => setDraft((current) => ({ ...current, imageUris: current.imageUris.filter((value) => value !== uri) }))} style={s.removePhoto}><Text style={{ color: '#FFFFFF', fontWeight: '600' }}>×</Text></Pressable></View>)}</ScrollView>}
               </>}
               {composerMode === 'voice' && <View style={s.voiceControls}>
-                <Pressable accessibilityRole="button" accessibilityLabel={recorderState.isRecording ? 'Dừng và lưu ghi âm' : 'Bắt đầu ghi âm'} onPress={record} style={({ pressed }) => [s.voiceRecordButton, { backgroundColor: recorderState.isRecording ? '#C84535' : colors.primary, opacity: pressed ? 0.82 : 1 }]}>
+                <Pressable accessibilityRole="button" accessibilityLabel={recorderState.isRecording ? 'Dừng ghi âm' : 'Bắt đầu ghi âm'} onPress={record} style={({ pressed }) => [s.voiceRecordButton, { backgroundColor: recorderState.isRecording ? '#C84535' : colors.primary, opacity: pressed ? 0.82 : 1 }]}>
                   <MicIcon color="#FFFFFF" />
-                  <Text style={s.voiceRecordLabel}>{recorderState.isRecording ? 'Dừng và lưu' : 'Bắt đầu ghi âm'}</Text>
+                  <Text style={s.voiceRecordLabel}>{recorderState.isRecording ? 'Dừng ghi âm' : 'Bắt đầu ghi âm'}</Text>
                 </Pressable>
-                <Text style={[s.sectionCaption, { color: colors.muted, textAlign: 'center' }]}>{recorderState.isRecording ? transcribing ? 'Đang ghi và chuyển giọng nói thành chữ…' : 'Đang ghi âm…' : 'Bản ghi âm và phần chữ sẽ tự lưu khi dừng.'}</Text>
-                {voiceSaveError && <Pressable onPress={() => finishVoiceNoteRef.current?.()} style={[s.retrySave, { backgroundColor: colors.surfaceAlt, borderColor: colors.line }]}><Text style={{ color: colors.ink, fontWeight: '700' }}>Thử lưu lại</Text></Pressable>}
+                <Text style={[s.sectionCaption, { color: colors.muted, textAlign: 'center' }]}>{recorderState.isRecording ? transcribing ? 'Đang ghi và chuyển lời nói thành chữ…' : 'Đang ghi âm…' : audioUri ? 'Nghe lại, chỉnh phần chữ hoặc ghi lại trước khi lưu.' : 'Chạm nút lớn để bắt đầu ghi.'}</Text>
+                {!!audioUri && <View style={s.voiceReview}><AudioPlayback uri={audioUri} palette={colors} /><Pressable onPress={() => { void retakeVoice(); }} style={[s.retakeButton, { backgroundColor: colors.surfaceAlt, borderColor: colors.line }]}><Text style={{ color: colors.ink, fontWeight: '600' }}>↻  Ghi lại</Text></Pressable></View>}
               </View>}
               {!!audioUri && composerMode !== 'voice' && <View style={s.pills}><AudioPlayback uri={audioUri} palette={colors} />{composerMode === 'note' && <Text style={{ color: colors.green, fontSize: 10 }}>Có bản ghi âm</Text>}</View>}
-              <View style={s.actions}>{editing && <Pressable onPress={() => { void removeEntry(); }} style={[s.delete, { borderColor: colors.line }]}><Text style={{ color: colors.primaryDark }}>Xóa mục</Text></Pressable>}<View style={{ flex: 1 }} />{composerMode !== 'voice' && <><Pressable onPress={closeComposer} style={[s.cancel, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink }}>Để sau</Text></Pressable><Pressable onPress={() => { void save(); }} style={[s.save, { backgroundColor: colors.primary }]}><Text style={{ color: '#FFFFFF', fontWeight: '600' }}>{composerMode === 'note' ? 'Lưu ghi chú' : composerMode === 'event' ? 'Lưu sự kiện' : 'Lưu lại ✿'}</Text></Pressable></>}</View>
+              <View style={s.actions}>{editing && <Pressable onPress={() => { void removeEntry(); }} style={[s.delete, { borderColor: colors.line }]}><Text style={{ color: colors.primaryDark }}>Xóa mục</Text></Pressable>}<View style={{ flex: 1 }} />{composerMode !== 'voice' ? <><Pressable onPress={closeComposer} style={[s.cancel, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink }}>Để sau</Text></Pressable><Pressable onPress={() => { void save(); }} style={[s.save, { backgroundColor: colors.primary }]}><Text style={{ color: '#FFFFFF', fontWeight: '600' }}>{composerMode === 'note' ? 'Lưu ghi chú' : composerMode === 'event' ? 'Lưu sự kiện' : 'Lưu lại ✿'}</Text></Pressable></> : <><Pressable onPress={closeComposer} style={[s.cancel, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink }}>Để sau</Text></Pressable><Pressable disabled={!audioUri || recorderState.isRecording || transcribing || voiceSaveBusyRef.current} onPress={() => { void saveVoiceNote(); }} style={[s.save, { backgroundColor: audioUri && !recorderState.isRecording && !transcribing ? colors.primary : colors.line, opacity: voiceSaveBusyRef.current ? 0.65 : 1 }]}><Text style={{ color: '#FFFFFF', fontWeight: '600' }}>Lưu ghi âm</Text></Pressable></>}</View>
             </ScrollView>
           </View>
         </KeyboardAvoidingView>
@@ -802,7 +802,7 @@ function EntryRow({ item, palette, onOpen, onToggle, compact, petIcon }: { item:
   }, [done, petScale, petTilt, bloom]);
   const details = when(item.dueAt);
   return <Pressable onPress={onOpen} style={({ pressed }) => [s.entry, compact && s.entryCompact, { backgroundColor: done ? palette.surfaceAlt : palette.surface, borderColor: palette.line, opacity: done ? 0.56 : pressed ? 0.84 : 1 }]}>
-    {item.kind !== 'note' && <Pressable onPress={(event) => { event.stopPropagation(); onToggle(); }} accessibilityRole="checkbox" accessibilityState={{ checked: done }} hitSlop={6} style={[s.check, { borderColor: done ? palette.green : palette.line, backgroundColor: done ? palette.green : 'transparent' }]}><Text style={{ color: '#FFFFFF', fontSize: 17, fontWeight: '700' }}>{done ? '✓' : ''}</Text></Pressable>}
+    <Pressable onPress={(event) => { event.stopPropagation(); onToggle(); }} accessibilityRole="checkbox" accessibilityState={{ checked: done }} hitSlop={6} style={[s.check, { borderColor: done ? palette.green : palette.line, backgroundColor: done ? palette.green : 'transparent' }]}><Text style={{ color: '#FFFFFF', fontSize: 17, fontWeight: '700' }}>{done ? '✓' : ''}</Text></Pressable>
     <View style={{ flex: 1 }}><View style={s.entryHeadline}><Text numberOfLines={1} style={[s.entryTitle, { color: done ? palette.muted : palette.ink, textDecorationLine: done ? 'line-through' : 'none' }]}>{item.title}</Text><Text style={[s.badge, { backgroundColor: palette.surfaceAlt, color: palette.ink }]}>{KIND_ICON[item.kind]} {KIND_LABEL[item.kind]}</Text></View>
       {!!item.body && <Text numberOfLines={2} style={[s.entryBody, { color: palette.muted }]}>{item.body}</Text>}{!!details && <Text style={[s.meta, { color: palette.muted }]}>{details}</Text>}{!!item.imageUris.length && <Text style={[s.meta, { color: palette.primaryDark }]}>▧ {item.imageUris.length} ảnh</Text>}</View>
     <View style={s.petStage} pointerEvents="none">
@@ -811,6 +811,19 @@ function EntryRow({ item, palette, onOpen, onToggle, compact, petIcon }: { item:
       <Animated.Text style={[s.bloomFlower, s.bloomTop, bloomStyle, { color: palette.accent }]}>✿</Animated.Text>
       <Animated.Text style={[s.bloomFlower, s.bloomRight, bloomStyle, { color: palette.yellow }]}>✿</Animated.Text>
     </View>
+  </Pressable>;
+}
+function NoteRow({ item, palette, onOpen, onToggle, petIcon }: { item: Entry; palette: (typeof palettes)[ThemeName]; onOpen: () => void; onToggle: () => void; petIcon: number }) {
+  const done = item.status === 'done';
+  return <Pressable onPress={onOpen} style={({ pressed }) => [s.noteRow, { backgroundColor: done ? palette.surfaceAlt : palette.surface, borderColor: palette.line, opacity: done ? 0.58 : pressed ? 0.82 : 1 }]}>
+    <Pressable onPress={(event) => { event.stopPropagation(); onToggle(); }} accessibilityRole="checkbox" accessibilityState={{ checked: done }} accessibilityLabel={done ? 'Đánh dấu ghi chú chưa hoàn thành' : 'Đánh dấu ghi chú hoàn thành'} hitSlop={6} style={[s.check, { borderColor: done ? palette.green : palette.line, backgroundColor: done ? palette.green : 'transparent' }]}><Text style={{ color: '#FFFFFF', fontSize: 17, fontWeight: '700' }}>{done ? '✓' : ''}</Text></Pressable>
+    {item.imageUris[0] ? <MediaImage uri={item.imageUris[0]} style={s.noteRowPhoto} /> : <View style={[s.noteRowPet, { backgroundColor: palette.surfaceAlt }]}><Image source={petIcon} style={{ width: 38, height: 38 }} /></View>}
+    <View style={{ flex: 1, minWidth: 0 }}>
+      <Text numberOfLines={1} style={[s.entryTitle, { color: done ? palette.muted : palette.ink, textDecorationLine: done ? 'line-through' : 'none' }]}>{item.title}</Text>
+      {!!item.body && <Text numberOfLines={2} style={[s.entryBody, { color: palette.muted }]}>{item.body}</Text>}
+      <Text style={[s.meta, { color: palette.primaryDark }]}>{new Date(item.createdAt).toLocaleDateString('vi-VN')}{item.imageUris.length > 1 ? ` · ${item.imageUris.length} ảnh` : ''}</Text>
+    </View>
+    {item.audioUri && <AudioPlayback uri={item.audioUri} palette={palette} />}
   </Pressable>;
 }
 function Empty({ palette, emoji, title, label, onPress, petIcon }: { palette: (typeof palettes)[ThemeName]; emoji: string; title: string; label: string; onPress: () => void; petIcon?: number }) {
@@ -910,6 +923,7 @@ const s = StyleSheet.create({
   calendarGlyph: { width: 24, height: 23, borderWidth: 2, borderRadius: 5, marginTop: 3, overflow: 'visible' }, calendarHeader: { height: 6, borderTopLeftRadius: 2, borderTopRightRadius: 2, marginTop: 2, marginHorizontal: 2 }, calendarDays: { flexDirection: 'row', flexWrap: 'wrap', gap: 3, padding: 4 }, calendarDay: { width: 4, height: 4, borderRadius: 1 }, calendarRing: { position: 'absolute', top: -4, width: 3, height: 7, borderRadius: 2 },
   slidersGlyph: { width: 25, gap: 5 }, sliderTrackRow: { height: 5, justifyContent: 'center' }, sliderTrack: { height: 2, width: 24, borderRadius: 2 }, sliderKnob: { position: 'absolute', top: 0, width: 6, height: 6, borderRadius: 3, borderWidth: 1.5 },
   empty: { alignItems: 'center', gap: 8, padding: 21, borderWidth: 1, borderRadius: 18 }, emptyPet: { width: 84, height: 84 }, placeholderPet: { width: 70, height: 70 }, noteGrid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', marginTop: 4 },
+  noteRow: { minHeight: 75, borderWidth: 1, borderRadius: 15, padding: 9, flexDirection: 'row', alignItems: 'center', gap: 9 }, noteRowPhoto: { width: 52, height: 52, borderRadius: 10 }, noteRowPet: { width: 52, height: 52, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
   note: { borderWidth: 1, borderRadius: 5, padding: 9, marginBottom: 2, minHeight: 165, shadowColor: '#654B3D', shadowOpacity: 0.07, shadowRadius: 6, shadowOffset: { width: 1, height: 3 }, elevation: 1 },
   photo: { width: '100%', height: 95, borderRadius: 4, marginBottom: 8, backgroundColor: '#EADFD4' }, photoPlaceholder: { justifyContent: 'center', alignItems: 'center' },
   noteTitle: { fontSize: 14, fontWeight: '600', lineHeight: 19 }, noteBody: { fontSize: 12, lineHeight: 17, marginTop: 4 }, noteDate: { fontSize: 9, marginTop: 8 },
@@ -931,7 +945,7 @@ const s = StyleSheet.create({
   sheetTitle: { fontSize: 20, fontWeight: '600' }, close: { width: 31, height: 31, borderRadius: 11, alignItems: 'center', justifyContent: 'center' },
   label: { fontSize: 11, fontWeight: '600', marginTop: 10, marginBottom: 7 }, input: { borderWidth: 1, borderRadius: 12, paddingHorizontal: 11, paddingVertical: 10, minHeight: 46, fontSize: 15, marginBottom: 8 },
   bodyInput: { borderWidth: 1, borderRadius: 12, paddingHorizontal: 11, paddingVertical: 10, minHeight: 82, fontSize: 14, marginBottom: 2 },
-  voiceTranscript: { minHeight: 165, fontSize: 16, lineHeight: 24, padding: 15 }, voiceControls: { alignItems: 'center', gap: 11, marginTop: 18 }, voiceRecordButton: { width: '100%', minHeight: 76, borderRadius: 20, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 12 }, voiceRecordLabel: { color: '#FFFFFF', fontSize: 17, fontWeight: '700' },
+  voiceTranscript: { minHeight: 165, fontSize: 16, lineHeight: 24, padding: 15 }, voiceControls: { alignItems: 'center', gap: 11, marginTop: 18 }, voiceRecordButton: { width: '100%', minHeight: 76, borderRadius: 20, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 12 }, voiceRecordLabel: { color: '#FFFFFF', fontSize: 17, fontWeight: '700' }, voiceReview: { width: '100%', flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 9 }, retakeButton: { paddingHorizontal: 13, paddingVertical: 9, borderWidth: 1, borderRadius: 14 },
   color: { width: 25, height: 25, borderRadius: 13, borderWidth: 2, marginRight: 7 }, button: { borderRadius: 11, paddingHorizontal: 11, paddingVertical: 9, alignItems: 'center', justifyContent: 'center' },
   preview: { width: 84, height: 76, borderRadius: 9 }, removePhoto: { position: 'absolute', top: 4, right: 4, width: 21, height: 21, borderRadius: 11, backgroundColor: '#4C403ACC', justifyContent: 'center', alignItems: 'center' },
   actions: { flexDirection: 'row', alignItems: 'center', gap: 7, marginTop: 18 }, delete: { borderWidth: 1, borderRadius: 11, paddingVertical: 10, paddingHorizontal: 11 }, mediaActions: { flexDirection: 'row', gap: 8 }, mediaButton: { flex: 1, minHeight: 43, borderWidth: 1, borderRadius: 13, justifyContent: 'center', alignItems: 'center' }, retrySave: { paddingHorizontal: 18, paddingVertical: 11, borderRadius: 14, borderWidth: 1 },
