@@ -5,7 +5,7 @@ import { ExpoSpeechRecognitionModule, useSpeechRecognitionEvent } from 'expo-spe
 import { useEffect, useMemo, useRef, useState } from 'react';
 import Animated, { interpolate, useAnimatedStyle, useSharedValue, withSequence, withSpring, withTiming } from 'react-native-reanimated';
 import {
-  Alert, Image, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView,
+  Alert, Image, KeyboardAvoidingView, Modal, PanResponder, Platform, Pressable, ScrollView,
   StyleSheet, Text, TextInput, useWindowDimensions, View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -124,6 +124,7 @@ export default function HomeScreen() {
   const [audioUri, setAudioUri] = useState<string>();
   const [transcript, setTranscript] = useState('');
   const [transcribing, setTranscribing] = useState(false);
+  const [voiceSaveBusy, setVoiceSaveBusy] = useState(false);
   const transcriptRef = useRef('');
   const partialRef = useRef('');
   const contentBeforeTranscriptRef = useRef('');
@@ -132,6 +133,8 @@ export default function HomeScreen() {
   const pendingVoiceAudioRef = useRef<string | undefined>(undefined);
   const browserRecognitionEndRef = useRef<(() => void) | null>(null);
   const voiceSaveBusyRef = useRef(false);
+  const recordingSessionRef = useRef(0);
+  const recordingOperationRef = useRef(false);
   const recordingOptions = useMemo(() => {
     if (Platform.OS === 'ios') return {
       ...RecordingPresets.HIGH_QUALITY,
@@ -266,6 +269,7 @@ export default function HomeScreen() {
   }
   function beginVoiceNote(location: NoteLocation) {
     voiceSaveBusyRef.current = false;
+    setVoiceSaveBusy(false);
     pendingVoiceAudioRef.current = undefined;
     begin('note', undefined, 'voice', location);
   }
@@ -295,6 +299,7 @@ export default function HomeScreen() {
     const audio = audioUri || pendingVoiceAudioRef.current;
     if (!audio || voiceSaveBusyRef.current) return;
     voiceSaveBusyRef.current = true;
+    setVoiceSaveBusy(true);
     const body = draft.body.trim() || transcriptRef.current.trim();
     const now = new Date();
     const title = body.split('\n')[0]?.trim().slice(0, 54) || `Bản ghi âm · ${when(now.toISOString())}`;
@@ -319,6 +324,7 @@ export default function HomeScreen() {
       Alert.alert('Chưa lưu được ghi âm', 'Bản ghi vẫn đang mở. Kiểm tra dung lượng thiết bị rồi chạm Lưu lại.');
     } finally {
       voiceSaveBusyRef.current = false;
+      setVoiceSaveBusy(false);
     }
   }
   async function connectGoogle() {
@@ -491,8 +497,10 @@ export default function HomeScreen() {
   }
   async function retakeVoice() {
     if (recorderState.isRecording) { await record(); return; }
+    recordingSessionRef.current += 1;
     shouldRecognizeRef.current = false;
     browserRecognitionRef.current?.abort?.();
+    if (Platform.OS !== 'web') ExpoSpeechRecognitionModule.abort();
     setAudioUri(undefined);
     pendingVoiceAudioRef.current = undefined;
     transcriptRef.current = ''; partialRef.current = ''; contentBeforeTranscriptRef.current = '';
@@ -500,6 +508,8 @@ export default function HomeScreen() {
     setDraft((current) => ({ ...current, body: '', audioUri: undefined }));
   }
   async function record() {
+    if (recordingOperationRef.current) return;
+    recordingOperationRef.current = true;
     try {
       if (recorderState.isRecording) {
         if (Platform.OS === 'web') await stopBrowserTranscription();
@@ -518,10 +528,18 @@ export default function HomeScreen() {
         if (!permission.granted && permission.canAskAgain) permission = await requestRecordingPermissionsAsync();
         if (!permission.granted) { Alert.alert('Cần quyền micro', 'Hãy bật quyền micro cho Nhớ nha Xuda trong Cài đặt iPhone để ghi âm.'); return; }
         await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
+        recordingSessionRef.current += 1;
+        shouldRecognizeRef.current = false;
+        browserRecognitionRef.current?.abort?.();
+        if (Platform.OS !== 'web') ExpoSpeechRecognitionModule.abort();
+        transcriptRef.current = ''; partialRef.current = ''; contentBeforeTranscriptRef.current = '';
+        setTranscript(''); setTranscribing(false); setAudioUri(undefined); pendingVoiceAudioRef.current = undefined;
+        setDraft((value) => ({ ...value, body: '', audioUri: undefined }));
         await recorder.prepareToRecordAsync(); recorder.record();
         if (Platform.OS === 'web') startBrowserTranscription();
       }
     } catch { Alert.alert('Chưa ghi âm được', 'Kiểm tra quyền micro rồi thử lại nhé.'); }
+    finally { setTimeout(() => { recordingOperationRef.current = false; }, 220); }
   }
   function startBrowserTranscription() {
     const SpeechRecognition = (window as SpeechWindow).SpeechRecognition || (window as SpeechWindow).webkitSpeechRecognition;
@@ -531,8 +549,10 @@ export default function HomeScreen() {
     }
     try {
       const recognition = new SpeechRecognition();
+      const session = recordingSessionRef.current;
       recognition.lang = 'vi-VN'; recognition.continuous = true; recognition.interimResults = true;
       recognition.onresult = (event) => {
+        if (session !== recordingSessionRef.current) return;
         let finalText = transcriptRef.current;
         let interimText = '';
         for (let index = event.resultIndex; index < event.results.length; index += 1) {
@@ -549,10 +569,12 @@ export default function HomeScreen() {
         setDraft((current) => ({ ...current, body: [contentBeforeTranscriptRef.current, spokenText].filter(Boolean).join('\n') }));
       };
       recognition.onerror = (event) => {
+        if (session !== recordingSessionRef.current) return;
         setTranscribing(false);
         if (event.error !== 'aborted' && event.error !== 'no-speech') Alert.alert('Chưa chuyển được thành chữ', 'Kiểm tra quyền micro và kết nối mạng, rồi thử ghi âm lại nhé.');
       };
       recognition.onend = () => {
+        if (session !== recordingSessionRef.current) return;
         if (shouldRecognizeRef.current) {
           window.setTimeout(() => { try { recognition.start(); } catch { /* A recognition session may still be winding down. */ } }, 250);
         } else {
@@ -599,9 +621,22 @@ export default function HomeScreen() {
       Alert.alert('Chưa chuyển được thành chữ', 'Bản ghi âm vẫn được giữ lại để bạn nghe sau.');
     }
   }
-  const total = data.entries.filter((entry) => (entry.kind === 'task' || entry.kind === 'routine') && (!entry.dayKey || entry.dayKey <= todayKey)).length;
-  const done = data.entries.filter((entry) => (entry.kind === 'task' || entry.kind === 'routine') && (!entry.dayKey || entry.dayKey <= todayKey) && entry.status === 'done').length;
+  const progressItems = data.entries.filter((entry) =>
+    ((entry.kind === 'task' || entry.kind === 'routine') && (!entry.dayKey || entry.dayKey <= todayKey)) ||
+    (entry.kind === 'note' && entry.noteLocation === 'today'));
+  const total = progressItems.length;
+  const done = progressItems.filter((entry) => entry.status === 'done').length;
   const mainWidth = tablet ? 930 : 600;
+  // PanResponder stores these callbacks for later touch events; it does not invoke them during render.
+  // eslint-disable-next-line react-hooks/refs
+  const composerSwipe = PanResponder.create({
+    onMoveShouldSetPanResponder: (_event, gesture) => gesture.dy > 8 && Math.abs(gesture.dy) > Math.abs(gesture.dx),
+    onPanResponderRelease: (_event, gesture) => { if (gesture.dy > 65) void closeComposer(); },
+  });
+  const eventSwipe = PanResponder.create({
+    onMoveShouldSetPanResponder: (_event, gesture) => gesture.dy > 8 && Math.abs(gesture.dy) > Math.abs(gesture.dx),
+    onPanResponderRelease: (_event, gesture) => { if (gesture.dy > 65) setEventDetail(null); },
+  });
 
 
   return (
@@ -610,7 +645,6 @@ export default function HomeScreen() {
         <View style={s.topbar}>
           <View style={[s.logo, { backgroundColor: colors.soft }]}><CalicoMascot color={colors.primaryDark} /></View>
           <View style={{ flex: 1 }}><Text style={[s.brand, { color: colors.ink }]}>Nhớ nha Xuda</Text></View>
-          <Pressable onPress={() => setTab('settings')} style={[s.avatar, { backgroundColor: colors.surfaceAlt }]}><Image source={petFor('avatar', petSeed)} style={s.avatarPet} /></Pressable>
         </View>
         <ScrollView contentContainerStyle={s.scroll} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
           {tab === 'today' && <>
@@ -682,7 +716,7 @@ export default function HomeScreen() {
         <KeyboardAvoidingView style={s.overlay} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
           <Pressable style={StyleSheet.absoluteFill} onPress={closeComposer} />
           <View style={[s.sheet, { backgroundColor: colors.paper, maxWidth: tablet ? 720 : 600, maxHeight: '97%' }]}>
-            <View style={[s.handle, { backgroundColor: colors.line }]} />
+            <View {...composerSwipe.panHandlers} style={s.dragHandleArea}><View style={[s.handle, { backgroundColor: colors.line }]} /></View>
             <View style={s.sheetHead}><View><Text style={[s.sheetTitle, { color: colors.ink }]}>{composerMode === 'voice' ? 'Ghi âm' : composerMode === 'note' ? editing ? 'Sửa ghi chú' : 'Ghi chú' : composerMode === 'event' ? editing ? 'Sửa sự kiện' : 'Sự kiện' : editing ? 'Sửa việc cần nhớ' : 'Thêm việc cần nhớ'}</Text><Text style={[s.sectionCaption, { color: colors.muted }]}>{composerMode === 'voice' ? 'Chạm nút lớn để bắt đầu nói.' : composerMode === 'note' ? 'Ghi lại điều bạn muốn giữ.' : composerMode === 'event' ? 'Cập nhật thông tin sự kiện.' : 'Thêm một việc cần nhớ.'}</Text></View><Pressable onPress={closeComposer} style={[s.close, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink, fontSize: 20 }}>×</Text></Pressable></View>
             <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 20 }}>
               {(composerMode === 'task' || composerMode === 'event') && <TextInput value={draft.title} onChangeText={(title) => setDraft((current) => ({ ...current, title }))} placeholder={composerMode === 'event' ? 'Tên sự kiện' : 'Việc cần nhớ là gì?'} placeholderTextColor={colors.muted} style={[s.input, { borderColor: colors.line, backgroundColor: colors.surface, color: colors.ink }]} />}
@@ -703,15 +737,15 @@ export default function HomeScreen() {
                 {!!draft.imageUris.length && <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 9, paddingVertical: 10 }}>{draft.imageUris.map((uri) => <View key={uri} style={{ position: 'relative' }}><MediaImage uri={uri} style={s.preview} /><Pressable onPress={() => setDraft((current) => ({ ...current, imageUris: current.imageUris.filter((value) => value !== uri) }))} style={s.removePhoto}><Text style={{ color: '#FFFFFF', fontWeight: '600' }}>×</Text></Pressable></View>)}</ScrollView>}
               </>}
               {composerMode === 'voice' && <View style={s.voiceControls}>
-                <Pressable accessibilityRole="button" accessibilityLabel={recorderState.isRecording ? 'Dừng ghi âm' : 'Bắt đầu ghi âm'} onPress={record} style={({ pressed }) => [s.voiceRecordButton, { backgroundColor: recorderState.isRecording ? '#C84535' : colors.primary, opacity: pressed ? 0.82 : 1 }]}>
+                <Pressable disabled={!!audioUri && !recorderState.isRecording} accessibilityRole="button" accessibilityLabel={recorderState.isRecording ? 'Dừng ghi âm' : 'Bắt đầu ghi âm'} onPress={record} style={({ pressed }) => [s.voiceRecordButton, { backgroundColor: recorderState.isRecording ? '#C84535' : audioUri ? colors.line : colors.primary, opacity: pressed ? 0.82 : 1 }]}>
                   <MicIcon color="#FFFFFF" />
-                  <Text style={s.voiceRecordLabel}>{recorderState.isRecording ? 'Dừng ghi âm' : 'Bắt đầu ghi âm'}</Text>
+                  <Text style={s.voiceRecordLabel}>{recorderState.isRecording ? 'Dừng ghi âm' : audioUri ? 'Đã ghi xong · nghe hoặc ghi lại' : 'Bắt đầu ghi âm'}</Text>
                 </Pressable>
                 <Text style={[s.sectionCaption, { color: colors.muted, textAlign: 'center' }]}>{recorderState.isRecording ? transcribing ? 'Đang ghi và chuyển lời nói thành chữ…' : 'Đang ghi âm…' : audioUri ? 'Nghe lại, chỉnh phần chữ hoặc ghi lại trước khi lưu.' : 'Chạm nút lớn để bắt đầu ghi.'}</Text>
                 {!!audioUri && <View style={s.voiceReview}><View style={{ flex: 1 }}><AudioPlayback uri={audioUri} palette={colors} /></View><Pressable accessibilityRole="button" onPress={() => { void retakeVoice(); }} style={[s.retakeButton, { backgroundColor: colors.surfaceAlt, borderColor: colors.line }]}><Text style={{ color: colors.ink, fontWeight: '600' }}>↻  Ghi lại</Text></Pressable></View>}
               </View>}
               {!!audioUri && composerMode !== 'voice' && <View style={s.pills}><AudioPlayback uri={audioUri} palette={colors} />{composerMode === 'note' && <Text style={{ color: colors.green, fontSize: 10 }}>Có bản ghi âm</Text>}</View>}
-              <View style={[s.actions, composerMode === 'voice' && s.voiceActions]}>{editing && <Pressable onPress={() => { void removeEntry(); }} style={[s.delete, { borderColor: colors.line }]}><Text style={{ color: colors.primaryDark }}>Xóa mục</Text></Pressable>}{composerMode === 'voice' ? <><Pressable onPress={closeComposer} style={[s.cancel, s.voiceSecondary, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink, fontWeight: '600' }}>Để sau</Text></Pressable><Pressable disabled={!audioUri || recorderState.isRecording || transcribing || voiceSaveBusyRef.current} onPress={() => { void saveVoiceNote(); }} style={[s.save, s.voicePrimary, { backgroundColor: audioUri && !recorderState.isRecording && !transcribing ? colors.primary : colors.line, opacity: voiceSaveBusyRef.current ? 0.65 : 1 }]}><Text style={{ color: '#FFFFFF', fontWeight: '700' }}>Lưu ghi âm</Text></Pressable></> : <><View style={{ flex: 1 }} /><Pressable onPress={closeComposer} style={[s.cancel, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink }}>Để sau</Text></Pressable><Pressable onPress={() => { void save(); }} style={[s.save, { backgroundColor: colors.primary }]}><Text style={{ color: '#FFFFFF', fontWeight: '600' }}>{composerMode === 'note' ? 'Lưu ghi chú' : composerMode === 'event' ? 'Lưu sự kiện' : 'Lưu lại ✿'}</Text></Pressable></>}</View>
+              <View style={[s.actions, composerMode === 'voice' && s.voiceActions]}>{editing && <Pressable onPress={() => { void removeEntry(); }} style={[s.delete, { borderColor: colors.line }]}><Text style={{ color: colors.primaryDark }}>Xóa mục</Text></Pressable>}{composerMode === 'voice' ? <><Pressable onPress={closeComposer} style={[s.cancel, s.voiceSecondary, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink, fontWeight: '600' }}>Để sau</Text></Pressable><Pressable disabled={!audioUri || recorderState.isRecording || transcribing || voiceSaveBusy} onPress={() => { void saveVoiceNote(); }} style={[s.save, s.voicePrimary, { backgroundColor: audioUri && !recorderState.isRecording && !transcribing ? colors.primary : colors.line, opacity: voiceSaveBusy ? 0.65 : 1 }]}><Text style={{ color: '#FFFFFF', fontWeight: '700' }}>Lưu ghi âm</Text></Pressable></> : <><View style={{ flex: 1 }} /><Pressable onPress={closeComposer} style={[s.cancel, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink }}>Để sau</Text></Pressable><Pressable onPress={() => { void save(); }} style={[s.save, { backgroundColor: colors.primary }]}><Text style={{ color: '#FFFFFF', fontWeight: '600' }}>{composerMode === 'note' ? 'Lưu ghi chú' : composerMode === 'event' ? 'Lưu sự kiện' : 'Lưu lại ✿'}</Text></Pressable></>}</View>
             </ScrollView>
           </View>
         </KeyboardAvoidingView>
@@ -721,7 +755,7 @@ export default function HomeScreen() {
           <Pressable style={StyleSheet.absoluteFill} onPress={() => setEventDetail(null)} />
           <View style={[s.sheet, { backgroundColor: colors.paper, maxWidth: tablet ? 620 : 600 }]}>
             {eventDetail && <>
-              <View style={[s.handle, { backgroundColor: colors.line }]} />
+              <View {...eventSwipe.panHandlers} style={s.dragHandleArea}><View style={[s.handle, { backgroundColor: colors.line }]} /></View>
               <View style={s.sheetHead}><View><Text style={[s.sectionCaption, { color: colors.primaryDark }]}>{eventDetail.googleEventId ? 'ĐỒNG BỘ GOOGLE CALENDAR' : 'SỰ KIỆN CỦA BẠN'}</Text><Text style={[s.sheetTitle, { color: colors.ink }]}>{eventDetail.title}</Text></View><Pressable onPress={() => setEventDetail(null)} style={[s.close, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink, fontSize: 20 }}>×</Text></Pressable></View>
               <View style={[s.eventDetailCard, { backgroundColor: colors.surface, borderColor: colors.line }]}>
                 <Text style={[s.eventDetailDate, { color: colors.primaryDark }]}>{eventDetail.dueAt ? new Date(eventDetail.dueAt).toLocaleDateString('vi-VN', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }) : 'Chưa đặt ngày'}</Text>
@@ -802,8 +836,8 @@ function EntryRow({ item, palette, onOpen, onToggle, compact, petIcon }: { item:
   const details = when(item.dueAt);
   return <Pressable onPress={onOpen} style={({ pressed }) => [s.entry, compact && s.entryCompact, { backgroundColor: done ? palette.surfaceAlt : palette.surface, borderColor: palette.line, opacity: done ? 0.56 : pressed ? 0.84 : 1 }]}>
     <Pressable onPress={(event) => { event.stopPropagation(); onToggle(); }} accessibilityRole="checkbox" accessibilityState={{ checked: done }} hitSlop={6} style={[s.check, { borderColor: done ? palette.green : palette.line, backgroundColor: done ? palette.green : 'transparent' }]}><Text style={{ color: '#FFFFFF', fontSize: 17, fontWeight: '700' }}>{done ? '✓' : ''}</Text></Pressable>
-    <View style={{ flex: 1 }}><View style={s.entryHeadline}><Text numberOfLines={1} style={[s.entryTitle, { color: done ? palette.muted : palette.ink, textDecorationLine: done ? 'line-through' : 'none' }]}>{item.title}</Text><Text style={[s.badge, { backgroundColor: palette.surfaceAlt, color: palette.ink }]}>{KIND_ICON[item.kind]} {KIND_LABEL[item.kind]}</Text></View>
-      {!!item.body && <Text numberOfLines={2} style={[s.entryBody, { color: palette.muted }]}>{item.body}</Text>}{!!details && <Text style={[s.meta, { color: palette.muted }]}>{details}</Text>}{!!item.imageUris.length && <Text style={[s.meta, { color: palette.primaryDark }]}>▧ {item.imageUris.length} ảnh</Text>}</View>
+    <View style={{ flex: 1, minWidth: 0 }}><View style={s.entryHeadline}><Text numberOfLines={1} style={[s.entryTitle, { color: done ? palette.muted : palette.ink, textDecorationLine: done ? 'line-through' : 'none' }]}>{item.title}</Text>{item.kind !== 'note' && <Text style={[s.badge, { backgroundColor: palette.surfaceAlt, color: palette.ink }]}>{KIND_ICON[item.kind]} {KIND_LABEL[item.kind]}</Text>}</View>
+      {!!item.body && <Text numberOfLines={2} style={[s.entryBody, { color: palette.muted }]}>{item.body}</Text>}{!!details && <Text style={[s.meta, { color: palette.muted }]}>{details}</Text>}{!!item.imageUris.length && <Text style={[s.meta, { color: palette.primaryDark }]}>▧ {item.imageUris.length} ảnh</Text>}{!!item.audioUri && <View style={s.entryAudio}><AudioPlayback uri={item.audioUri} palette={palette} /></View>}</View>
     <View style={s.petStage} pointerEvents="none">
       <Animated.Image source={petIcon} style={[s.entryPet, petMotionStyle]} resizeMode="contain" />
       <Animated.Text style={[s.bloomFlower, s.bloomLeft, bloomStyle, { color: palette.pink }]}>✿</Animated.Text>
@@ -814,15 +848,29 @@ function EntryRow({ item, palette, onOpen, onToggle, compact, petIcon }: { item:
 }
 function NoteRow({ item, palette, onOpen, onToggle, petIcon }: { item: Entry; palette: (typeof palettes)[ThemeName]; onOpen: () => void; onToggle: () => void; petIcon: number }) {
   const done = item.status === 'done';
+  const wasDone = useRef(done);
+  const petScale = useSharedValue(1);
+  const petTilt = useSharedValue(0);
+  const bloom = useSharedValue(0);
+  const bloomStyle = useAnimatedStyle(() => ({ opacity: interpolate(bloom.value, [0, 0.2, 1], [0, 1, 0]), transform: [{ scale: interpolate(bloom.value, [0, 0.35, 1], [0.25, 1.2, 1.45]) }, { translateY: interpolate(bloom.value, [0, 1], [5, -10]) }] }));
+  useEffect(() => {
+    if (done && !wasDone.current) {
+      petScale.value = withSequence(withSpring(1.5, { damping: 6 }), withSpring(1, { damping: 8 }));
+      petTilt.value = withSequence(withTiming(-8, { duration: 100 }), withTiming(8, { duration: 120 }), withTiming(0, { duration: 150 }));
+      // eslint-disable-next-line react-hooks/immutability
+      bloom.value = withSequence(withTiming(1, { duration: 220 }), withTiming(0, { duration: 650 }));
+    }
+    wasDone.current = done;
+  }, [done, petScale, petTilt, bloom]);
+  const petStageStyle = useAnimatedStyle(() => ({ transform: [{ scale: petScale.value }, { rotate: `${petTilt.value}deg` }] }));
   return <Pressable onPress={onOpen} style={({ pressed }) => [s.noteRow, { backgroundColor: done ? palette.surfaceAlt : palette.surface, borderColor: palette.line, opacity: done ? 0.58 : pressed ? 0.82 : 1 }]}>
     <Pressable onPress={(event) => { event.stopPropagation(); onToggle(); }} accessibilityRole="checkbox" accessibilityState={{ checked: done }} accessibilityLabel={done ? 'Đánh dấu ghi chú chưa hoàn thành' : 'Đánh dấu ghi chú hoàn thành'} hitSlop={6} style={[s.check, { borderColor: done ? palette.green : palette.line, backgroundColor: done ? palette.green : 'transparent' }]}><Text style={{ color: '#FFFFFF', fontSize: 17, fontWeight: '700' }}>{done ? '✓' : ''}</Text></Pressable>
-    {item.imageUris[0] ? <MediaImage uri={item.imageUris[0]} style={s.noteRowPhoto} /> : <View style={[s.noteRowPet, { backgroundColor: palette.surfaceAlt }]}><Image source={petIcon} style={{ width: 38, height: 38 }} /></View>}
+    <View style={[s.noteRowPet, { backgroundColor: palette.surfaceAlt }]}><Animated.Image source={petIcon} style={[{ width: 32, height: 32 }, petStageStyle]} /><Animated.Text pointerEvents="none" style={[s.bloomFlower, s.bloomLeft, bloomStyle, { color: palette.pink }]}>✿</Animated.Text><Animated.Text pointerEvents="none" style={[s.bloomFlower, s.bloomTop, bloomStyle, { color: palette.accent }]}>✿</Animated.Text><Animated.Text pointerEvents="none" style={[s.bloomFlower, s.bloomRight, bloomStyle, { color: palette.yellow }]}>✿</Animated.Text></View>
     <View style={{ flex: 1, minWidth: 0 }}>
       <Text numberOfLines={1} style={[s.entryTitle, { color: done ? palette.muted : palette.ink, textDecorationLine: done ? 'line-through' : 'none' }]}>{item.title}</Text>
-      {!!item.body && <Text numberOfLines={2} style={[s.entryBody, { color: palette.muted }]}>{item.body}</Text>}
-      <Text style={[s.meta, { color: palette.primaryDark }]}>{new Date(item.createdAt).toLocaleDateString('vi-VN')}{item.imageUris.length > 1 ? ` · ${item.imageUris.length} ảnh` : ''}</Text>
+      <Text style={[s.meta, { color: palette.muted }]}>{when(item.createdAt)}</Text>
     </View>
-    {item.audioUri && <AudioPlayback uri={item.audioUri} palette={palette} />}
+    {item.audioUri && <View style={s.noteAudio}><AudioPlayback uri={item.audioUri} palette={palette} /></View>}
   </Pressable>;
 }
 function Empty({ palette, emoji, title, label, onPress, petIcon }: { palette: (typeof palettes)[ThemeName]; emoji: string; title: string; label: string; onPress: () => void; petIcon?: number }) {
@@ -922,7 +970,7 @@ const s = StyleSheet.create({
   calendarGlyph: { width: 24, height: 23, borderWidth: 2, borderRadius: 5, marginTop: 3, overflow: 'visible' }, calendarHeader: { height: 6, borderTopLeftRadius: 2, borderTopRightRadius: 2, marginTop: 2, marginHorizontal: 2 }, calendarDays: { flexDirection: 'row', flexWrap: 'wrap', gap: 3, padding: 4 }, calendarDay: { width: 4, height: 4, borderRadius: 1 }, calendarRing: { position: 'absolute', top: -4, width: 3, height: 7, borderRadius: 2 },
   slidersGlyph: { width: 25, gap: 5 }, sliderTrackRow: { height: 5, justifyContent: 'center' }, sliderTrack: { height: 2, width: 24, borderRadius: 2 }, sliderKnob: { position: 'absolute', top: 0, width: 6, height: 6, borderRadius: 3, borderWidth: 1.5 },
   empty: { alignItems: 'center', gap: 8, padding: 21, borderWidth: 1, borderRadius: 18 }, emptyPet: { width: 84, height: 84 }, placeholderPet: { width: 70, height: 70 }, noteGrid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', marginTop: 4 },
-  noteRow: { minHeight: 75, borderWidth: 1, borderRadius: 15, padding: 9, flexDirection: 'row', alignItems: 'center', gap: 9 }, noteRowPhoto: { width: 52, height: 52, borderRadius: 10 }, noteRowPet: { width: 52, height: 52, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
+  noteRow: { minHeight: 68, borderWidth: 1, borderRadius: 15, padding: 8, flexDirection: 'row', alignItems: 'center', gap: 8 }, noteRowPhoto: { width: 52, height: 52, borderRadius: 10 }, noteRowPet: { width: 40, height: 40, borderRadius: 12, alignItems: 'center', justifyContent: 'center', position: 'relative', overflow: 'visible' }, noteAudio: { width: 128 }, entryAudio: { width: 142, marginTop: 7 },
   note: { borderWidth: 1, borderRadius: 5, padding: 9, marginBottom: 2, minHeight: 165, shadowColor: '#654B3D', shadowOpacity: 0.07, shadowRadius: 6, shadowOffset: { width: 1, height: 3 }, elevation: 1 },
   photo: { width: '100%', height: 95, borderRadius: 4, marginBottom: 8, backgroundColor: '#EADFD4' }, photoPlaceholder: { justifyContent: 'center', alignItems: 'center' },
   noteTitle: { fontSize: 14, fontWeight: '600', lineHeight: 19 }, noteBody: { fontSize: 12, lineHeight: 17, marginTop: 4 }, noteDate: { fontSize: 9, marginTop: 8 },
@@ -940,7 +988,7 @@ const s = StyleSheet.create({
   version: { textAlign: 'center', fontSize: 8, letterSpacing: 1, marginVertical: 22 },
   overlay: { flex: 1, justifyContent: 'flex-end', alignItems: 'center', backgroundColor: '#342A2770' },
   sheet: { width: '100%', maxHeight: '97%', borderTopLeftRadius: 24, borderTopRightRadius: 24, paddingHorizontal: 18, paddingTop: 9, paddingBottom: Platform.OS === 'ios' ? 18 : 10 },
-  handle: { width: 38, height: 4, borderRadius: 2, alignSelf: 'center', marginBottom: 13 }, sheetHead: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 },
+  dragHandleArea: { minHeight: 34, justifyContent: 'center', alignItems: 'center' }, handle: { width: 42, height: 5, borderRadius: 3, alignSelf: 'center' }, sheetHead: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 },
   sheetTitle: { fontSize: 20, fontWeight: '600' }, close: { width: 46, height: 46, borderRadius: 15, alignItems: 'center', justifyContent: 'center' },
   label: { fontSize: 11, fontWeight: '600', marginTop: 10, marginBottom: 7 }, input: { borderWidth: 1, borderRadius: 12, paddingHorizontal: 11, paddingVertical: 10, minHeight: 46, fontSize: 15, marginBottom: 8 },
   bodyInput: { borderWidth: 1, borderRadius: 12, paddingHorizontal: 11, paddingVertical: 10, minHeight: 82, fontSize: 14, marginBottom: 2 }, expandedBodyInput: { minHeight: 230, fontSize: 16, lineHeight: 24, padding: 15 },

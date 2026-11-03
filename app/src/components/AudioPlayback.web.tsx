@@ -27,7 +27,8 @@ export function AudioPlayback({ uri, palette }: { uri: string; palette: Palette 
     return () => { active = false; audio.current?.pause(); audio.current = null; };
   }, [uri]);
   return (
-    <Pressable disabled={!ready || failed} onPress={() => {
+    <Pressable disabled={!ready || failed} onPress={(event) => {
+      event.stopPropagation();
       const player = audio.current;
       if (!player) return;
       if (player.paused) { void player.play().then(() => setPlaying(true)).catch(() => setFailedUri(uri)); }
