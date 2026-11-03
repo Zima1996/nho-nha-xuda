@@ -19,7 +19,7 @@ const todayAt = (hour: number, minute = 0) => {
 };
 
 export const starterData: AppData = {
-  theme: 'the-anh',
+  theme: 'nature',
   todayKey: localDayKey(now),
   entries: [
     {
