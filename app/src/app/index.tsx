@@ -242,6 +242,7 @@ export default function HomeScreen() {
   }
 
   function begin(kindValue: EntryKind = 'task', item?: Entry, mode?: ComposerMode, location?: NoteLocation) {
+    composerDragY.value = 0;
     setEditing(item?.id || null);
     setComposerMode(mode || (kindValue === 'note' ? 'note' : kindValue === 'event' ? 'event' : 'task'));
     if (kindValue === 'note') setNoteLocation(item?.noteLocation || location || 'calendar');
@@ -627,15 +628,41 @@ export default function HomeScreen() {
   const total = progressItems.length;
   const done = progressItems.filter((entry) => entry.status === 'done').length;
   const mainWidth = tablet ? 930 : 600;
+  const composerDragY = useSharedValue(0);
+  const eventDragY = useSharedValue(0);
+  const composerSheetStyle = useAnimatedStyle(() => ({ transform: [{ translateY: composerDragY.value }] }));
+  const eventSheetStyle = useAnimatedStyle(() => ({ transform: [{ translateY: eventDragY.value }] }));
   // PanResponder stores these callbacks for later touch events; it does not invoke them during render.
   // eslint-disable-next-line react-hooks/refs
   const composerSwipe = PanResponder.create({
     onMoveShouldSetPanResponder: (_event, gesture) => gesture.dy > 8 && Math.abs(gesture.dy) > Math.abs(gesture.dx),
-    onPanResponderRelease: (_event, gesture) => { if (gesture.dy > 65) void closeComposer(); },
+    // PanResponder callbacks run on touch events; Reanimated values are intentionally updated here.
+    // eslint-disable-next-line react-hooks/immutability
+    onPanResponderMove: (_event, gesture) => { composerDragY.value = Math.max(0, gesture.dy); },
+    onPanResponderRelease: (_event, gesture) => {
+      if (gesture.dy > 115) {
+        void closeComposer();
+        // eslint-disable-next-line react-hooks/immutability
+        composerDragY.value = 0;
+      } else {
+        composerDragY.value = withSpring(0, { damping: 22, stiffness: 220 });
+      }
+    },
   });
   const eventSwipe = PanResponder.create({
     onMoveShouldSetPanResponder: (_event, gesture) => gesture.dy > 8 && Math.abs(gesture.dy) > Math.abs(gesture.dx),
-    onPanResponderRelease: (_event, gesture) => { if (gesture.dy > 65) setEventDetail(null); },
+    // PanResponder callbacks run on touch events; Reanimated values are intentionally updated here.
+    // eslint-disable-next-line react-hooks/immutability
+    onPanResponderMove: (_event, gesture) => { eventDragY.value = Math.max(0, gesture.dy); },
+    onPanResponderRelease: (_event, gesture) => {
+      if (gesture.dy > 115) {
+        setEventDetail(null);
+        // eslint-disable-next-line react-hooks/immutability
+        eventDragY.value = 0;
+      } else {
+        eventDragY.value = withSpring(0, { damping: 22, stiffness: 220 });
+      }
+    },
   });
 
 
@@ -662,7 +689,9 @@ export default function HomeScreen() {
             <View style={s.sectionTop}><Text style={[s.sectionTitle, { color: colors.ink }]}>Việc cần nhớ</Text><QuickActions palette={colors} onRecord={() => beginVoiceNote('today')} onAdd={() => beginQuickNote('today')} addLabel="Ghi chú" /></View>
             <Search value={query} onChange={setQuery} palette={colors} />
             <View style={s.listHead}><Text style={[s.dayLabel, { color: colors.muted }]}>HÔM NAY · {list.length} MỤC</Text><Text style={[s.handText, { color: colors.primaryDark }]}>{copy.nudge}</Text></View>
-            {list.length ? <View style={tablet ? s.grid : undefined}>{list.map((item) => <EntryRow key={item.id} item={item} palette={colors} petIcon={petFor(item.id, petSeed)} compact={tablet} onOpen={() => item.kind === 'note' ? beginQuickNote('today', item) : begin(item.kind, item)} onToggle={() => put({ ...item, status: item.status === 'done' ? 'todo' : 'done' })} />)}</View> : <View style={[s.empty, { backgroundColor: colors.surface, borderColor: colors.line }]}><Image source={petFor('empty-today', petSeed)} style={s.emptyPet} /><Text style={[s.sectionTitle, { color: colors.ink }]}>Chưa có gì ở đây</Text><Text style={[s.subtitle, { color: colors.muted }]}>{copy.empty}</Text><Button label="＋ Ghi chú" primary palette={colors} onPress={() => beginQuickNote('today')} /></View>}
+            {list.length ? <View style={tablet ? s.grid : undefined}>{list.map((item) => item.kind === 'note'
+              ? <NoteRow key={item.id} item={item} palette={colors} petIcon={petFor(item.id, petSeed)} compact={tablet} onOpen={() => beginQuickNote('today', item)} onToggle={() => put({ ...item, status: item.status === 'done' ? 'todo' : 'done' })} onDelete={() => { void removeEntry(item.id); }} />
+              : <EntryRow key={item.id} item={item} palette={colors} petIcon={petFor(item.id, petSeed)} compact={tablet} onOpen={() => begin(item.kind, item)} onToggle={() => put({ ...item, status: item.status === 'done' ? 'todo' : 'done' })} />)}</View> : <View style={[s.empty, { backgroundColor: colors.surface, borderColor: colors.line }]}><Image source={petFor('empty-today', petSeed)} style={s.emptyPet} /><Text style={[s.sectionTitle, { color: colors.ink }]}>Chưa có gì ở đây</Text><Text style={[s.subtitle, { color: colors.muted }]}>{copy.empty}</Text><Button label="＋ Ghi chú" primary palette={colors} onPress={() => beginQuickNote('today')} /></View>}
           </>}
           {tab === 'calendar' && <>
             <View style={s.sectionTop}><Text style={[s.sectionTitle, { color: colors.ink }]}>Lịch</Text>{calendarSection === 'notes' && <QuickActions palette={colors} onRecord={() => beginVoiceNote('calendar')} onAdd={() => beginQuickNote('calendar')} addLabel="Ghi chú" />}</View>
@@ -679,10 +708,10 @@ export default function HomeScreen() {
             <Search value={query} onChange={setQuery} palette={colors} />
             {calendarSection === 'events' ? <>
               <Pressable onPress={syncCalendar} style={[s.integration, { borderColor: colors.line, backgroundColor: colors.surface }]}><Text style={{ fontSize: 22 }}>🗓️</Text><View style={{ flex: 1 }}><Text style={[s.integrationTitle, { color: colors.ink }]}>Google Calendar</Text><Text style={[s.integrationSub, { color: colors.muted }]}>{googleBusy ? 'Đang đồng bộ…' : googleAccessToken && data.googleEmail ? `Đã kết nối · ${data.googleEmail} · Chạm để đồng bộ` : data.googleEmail ? `Tài khoản đã dùng · ${data.googleEmail} · Chạm để kết nối` : 'Đăng nhập trong Setting để đồng bộ'}</Text></View><Text style={{ color: colors.primary, fontSize: 21 }}>{googleAccessToken ? '↻' : '›'}</Text></Pressable>
-              {list.map((item) => <EventRow key={item.id} item={item} palette={colors} petIcon={petFor(item.id, petSeed)} onPress={() => setEventDetail(item)} />)}
+              {list.map((item) => <EventRow key={item.id} item={item} palette={colors} petIcon={petFor(item.id, petSeed)} onPress={() => { eventDragY.value = 0; setEventDetail(item); }} />)}
               {!list.length && <Empty palette={colors} emoji="☕" petIcon={petFor('empty-calendar', petSeed)} title="Chưa có sự kiện sắp tới" label="Đồng bộ Google Calendar" onPress={() => syncCalendar()} />}
             </> : <>
-              <View style={{ gap: 8, marginTop: 4 }}>{list.map((item) => <NoteRow key={item.id} item={item} palette={colors} petIcon={petFor(item.id, petSeed)} onOpen={() => beginQuickNote('calendar', item)} onToggle={() => put({ ...item, status: item.status === 'done' ? 'todo' : 'done' })} />)}</View>
+              <View style={{ gap: 8, marginTop: 4 }}>{list.map((item) => <NoteRow key={item.id} item={item} palette={colors} petIcon={petFor(item.id, petSeed)} onOpen={() => beginQuickNote('calendar', item)} onToggle={() => put({ ...item, status: item.status === 'done' ? 'todo' : 'done' })} onDelete={() => { void removeEntry(item.id); }} />)}</View>
               {!list.length && <Empty palette={colors} emoji="📔" petIcon={petFor('empty-notes', petSeed)} title="Chưa có ghi chú nào" label="＋ Ghi chú" onPress={() => beginQuickNote('calendar')} />}
             </>}
           </>}
@@ -715,9 +744,9 @@ export default function HomeScreen() {
       <Modal visible={visible} animationType="slide" transparent onRequestClose={closeComposer}>
         <KeyboardAvoidingView style={s.overlay} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
           <Pressable style={StyleSheet.absoluteFill} onPress={closeComposer} />
-          <View style={[s.sheet, { backgroundColor: colors.paper, maxWidth: tablet ? 720 : 600, maxHeight: '97%' }]}>
+          <Animated.View style={[s.sheet, composerSheetStyle, { backgroundColor: colors.paper, maxWidth: tablet ? 720 : 600, maxHeight: '97%' }]}>
             <View {...composerSwipe.panHandlers} style={s.dragHandleArea}><View style={[s.handle, { backgroundColor: colors.line }]} /></View>
-            <View style={s.sheetHead}><View><Text style={[s.sheetTitle, { color: colors.ink }]}>{composerMode === 'voice' ? 'Ghi âm' : composerMode === 'note' ? editing ? 'Sửa ghi chú' : 'Ghi chú' : composerMode === 'event' ? editing ? 'Sửa sự kiện' : 'Sự kiện' : editing ? 'Sửa việc cần nhớ' : 'Thêm việc cần nhớ'}</Text><Text style={[s.sectionCaption, { color: colors.muted }]}>{composerMode === 'voice' ? 'Chạm nút lớn để bắt đầu nói.' : composerMode === 'note' ? 'Ghi lại điều bạn muốn giữ.' : composerMode === 'event' ? 'Cập nhật thông tin sự kiện.' : 'Thêm một việc cần nhớ.'}</Text></View><Pressable onPress={closeComposer} style={[s.close, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink, fontSize: 20 }}>×</Text></Pressable></View>
+            <View {...composerSwipe.panHandlers} style={s.sheetHead}><View><Text style={[s.sheetTitle, { color: colors.ink }]}>{composerMode === 'voice' ? 'Ghi âm' : composerMode === 'note' ? editing ? 'Sửa ghi chú' : 'Ghi chú' : composerMode === 'event' ? editing ? 'Sửa sự kiện' : 'Sự kiện' : editing ? 'Sửa việc cần nhớ' : 'Thêm việc cần nhớ'}</Text><Text style={[s.sectionCaption, { color: colors.muted }]}>{composerMode === 'voice' ? 'Chạm nút lớn để bắt đầu nói.' : composerMode === 'note' ? 'Ghi lại điều bạn muốn giữ.' : composerMode === 'event' ? 'Cập nhật thông tin sự kiện.' : 'Thêm một việc cần nhớ.'}</Text></View><Pressable onPress={closeComposer} style={[s.close, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink, fontSize: 20 }}>×</Text></Pressable></View>
             <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 20 }}>
               {(composerMode === 'task' || composerMode === 'event') && <TextInput value={draft.title} onChangeText={(title) => setDraft((current) => ({ ...current, title }))} placeholder={composerMode === 'event' ? 'Tên sự kiện' : 'Việc cần nhớ là gì?'} placeholderTextColor={colors.muted} style={[s.input, { borderColor: colors.line, backgroundColor: colors.surface, color: colors.ink }]} />}
               {composerMode === 'event' && <><Text style={[s.label, { color: colors.ink }]}>Ngày và giờ</Text><View style={s.eventDateFields}><TextInput value={eventDateText} onChangeText={setEventDateText} placeholder="YYYY-MM-DD" placeholderTextColor={colors.muted} style={[s.input, s.eventDateInput, { borderColor: colors.line, backgroundColor: colors.surface, color: colors.ink }]} /><TextInput value={eventTimeText} onChangeText={setEventTimeText} placeholder="HH:MM" placeholderTextColor={colors.muted} style={[s.input, s.eventTimeInput, { borderColor: colors.line, backgroundColor: colors.surface, color: colors.ink }]} /></View></>}
@@ -747,16 +776,16 @@ export default function HomeScreen() {
               {!!audioUri && composerMode !== 'voice' && <View style={s.pills}><AudioPlayback uri={audioUri} palette={colors} />{composerMode === 'note' && <Text style={{ color: colors.green, fontSize: 10 }}>Có bản ghi âm</Text>}</View>}
               <View style={[s.actions, composerMode === 'voice' && s.voiceActions]}>{editing && <Pressable onPress={() => { void removeEntry(); }} style={[s.delete, { borderColor: colors.line }]}><Text style={{ color: colors.primaryDark }}>Xóa mục</Text></Pressable>}{composerMode === 'voice' ? <><Pressable onPress={closeComposer} style={[s.cancel, s.voiceSecondary, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink, fontWeight: '600' }}>Để sau</Text></Pressable><Pressable disabled={!audioUri || recorderState.isRecording || transcribing || voiceSaveBusy} onPress={() => { void saveVoiceNote(); }} style={[s.save, s.voicePrimary, { backgroundColor: audioUri && !recorderState.isRecording && !transcribing ? colors.primary : colors.line, opacity: voiceSaveBusy ? 0.65 : 1 }]}><Text style={{ color: '#FFFFFF', fontWeight: '700' }}>Lưu ghi âm</Text></Pressable></> : <><View style={{ flex: 1 }} /><Pressable onPress={closeComposer} style={[s.cancel, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink }}>Để sau</Text></Pressable><Pressable onPress={() => { void save(); }} style={[s.save, { backgroundColor: colors.primary }]}><Text style={{ color: '#FFFFFF', fontWeight: '600' }}>{composerMode === 'note' ? 'Lưu ghi chú' : composerMode === 'event' ? 'Lưu sự kiện' : 'Lưu lại ✿'}</Text></Pressable></>}</View>
             </ScrollView>
-          </View>
+          </Animated.View>
         </KeyboardAvoidingView>
       </Modal>
       <Modal visible={!!eventDetail} animationType="slide" transparent onRequestClose={() => setEventDetail(null)}>
         <View style={s.overlay}>
           <Pressable style={StyleSheet.absoluteFill} onPress={() => setEventDetail(null)} />
-          <View style={[s.sheet, { backgroundColor: colors.paper, maxWidth: tablet ? 620 : 600 }]}>
+          <Animated.View style={[s.sheet, eventSheetStyle, { backgroundColor: colors.paper, maxWidth: tablet ? 620 : 600 }]}>
             {eventDetail && <>
               <View {...eventSwipe.panHandlers} style={s.dragHandleArea}><View style={[s.handle, { backgroundColor: colors.line }]} /></View>
-              <View style={s.sheetHead}><View><Text style={[s.sectionCaption, { color: colors.primaryDark }]}>{eventDetail.googleEventId ? 'ĐỒNG BỘ GOOGLE CALENDAR' : 'SỰ KIỆN CỦA BẠN'}</Text><Text style={[s.sheetTitle, { color: colors.ink }]}>{eventDetail.title}</Text></View><Pressable onPress={() => setEventDetail(null)} style={[s.close, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink, fontSize: 20 }}>×</Text></Pressable></View>
+              <View {...eventSwipe.panHandlers} style={s.sheetHead}><View><Text style={[s.sectionCaption, { color: colors.primaryDark }]}>{eventDetail.googleEventId ? 'ĐỒNG BỘ GOOGLE CALENDAR' : 'SỰ KIỆN CỦA BẠN'}</Text><Text style={[s.sheetTitle, { color: colors.ink }]}>{eventDetail.title}</Text></View><Pressable onPress={() => setEventDetail(null)} style={[s.close, { backgroundColor: colors.surfaceAlt }]}><Text style={{ color: colors.ink, fontSize: 20 }}>×</Text></Pressable></View>
               <View style={[s.eventDetailCard, { backgroundColor: colors.surface, borderColor: colors.line }]}>
                 <Text style={[s.eventDetailDate, { color: colors.primaryDark }]}>{eventDetail.dueAt ? new Date(eventDetail.dueAt).toLocaleDateString('vi-VN', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }) : 'Chưa đặt ngày'}</Text>
                 <Text style={[s.eventDetailTime, { color: colors.ink }]}>{eventDetail.dueAt ? when(eventDetail.dueAt) : ''}</Text>
@@ -767,7 +796,7 @@ export default function HomeScreen() {
                 <Pressable onPress={() => { void removeEntry(eventDetail.id); }} style={[s.eventDetailButton, { backgroundColor: '#B83A32' }]}><Text style={{ color: '#FFFFFF', fontWeight: '700' }}>Xóa sự kiện</Text></Pressable>
               </View>
             </>}
-          </View>
+          </Animated.View>
         </View>
       </Modal>
     </SafeAreaView>
@@ -846,13 +875,16 @@ function EntryRow({ item, palette, onOpen, onToggle, compact, petIcon }: { item:
     </View>
   </Pressable>;
 }
-function NoteRow({ item, palette, onOpen, onToggle, petIcon }: { item: Entry; palette: (typeof palettes)[ThemeName]; onOpen: () => void; onToggle: () => void; petIcon: number }) {
+function NoteRow({ item, palette, onOpen, onToggle, onDelete, petIcon, compact }: { item: Entry; palette: (typeof palettes)[ThemeName]; onOpen: () => void; onToggle: () => void; onDelete: () => void; petIcon: number; compact?: boolean }) {
   const done = item.status === 'done';
   const wasDone = useRef(done);
   const petScale = useSharedValue(1);
   const petTilt = useSharedValue(0);
   const bloom = useSharedValue(0);
+  const swipeX = useSharedValue(0);
+  const swipeAnchor = useSharedValue(0);
   const bloomStyle = useAnimatedStyle(() => ({ opacity: interpolate(bloom.value, [0, 0.2, 1], [0, 1, 0]), transform: [{ scale: interpolate(bloom.value, [0, 0.35, 1], [0.25, 1.2, 1.45]) }, { translateY: interpolate(bloom.value, [0, 1], [5, -10]) }] }));
+  const swipeStyle = useAnimatedStyle(() => ({ transform: [{ translateX: swipeX.value }] }));
   useEffect(() => {
     if (done && !wasDone.current) {
       petScale.value = withSequence(withSpring(1.5, { damping: 6 }), withSpring(1, { damping: 8 }));
@@ -863,15 +895,38 @@ function NoteRow({ item, palette, onOpen, onToggle, petIcon }: { item: Entry; pa
     wasDone.current = done;
   }, [done, petScale, petTilt, bloom]);
   const petStageStyle = useAnimatedStyle(() => ({ transform: [{ scale: petScale.value }, { rotate: `${petTilt.value}deg` }] }));
-  return <Pressable onPress={onOpen} style={({ pressed }) => [s.noteRow, { backgroundColor: done ? palette.surfaceAlt : palette.surface, borderColor: palette.line, opacity: done ? 0.58 : pressed ? 0.82 : 1 }]}>
-    <Pressable onPress={(event) => { event.stopPropagation(); onToggle(); }} accessibilityRole="checkbox" accessibilityState={{ checked: done }} accessibilityLabel={done ? 'Đánh dấu ghi chú chưa hoàn thành' : 'Đánh dấu ghi chú hoàn thành'} hitSlop={6} style={[s.check, { borderColor: done ? palette.green : palette.line, backgroundColor: done ? palette.green : 'transparent' }]}><Text style={{ color: '#FFFFFF', fontSize: 17, fontWeight: '700' }}>{done ? '✓' : ''}</Text></Pressable>
-    <View style={[s.noteRowPet, { backgroundColor: palette.surfaceAlt }]}><Animated.Image source={petIcon} style={[{ width: 32, height: 32 }, petStageStyle]} /><Animated.Text pointerEvents="none" style={[s.bloomFlower, s.bloomLeft, bloomStyle, { color: palette.pink }]}>✿</Animated.Text><Animated.Text pointerEvents="none" style={[s.bloomFlower, s.bloomTop, bloomStyle, { color: palette.accent }]}>✿</Animated.Text><Animated.Text pointerEvents="none" style={[s.bloomFlower, s.bloomRight, bloomStyle, { color: palette.yellow }]}>✿</Animated.Text></View>
-    <View style={{ flex: 1, minWidth: 0 }}>
-      <Text numberOfLines={1} style={[s.entryTitle, { color: done ? palette.muted : palette.ink, textDecorationLine: done ? 'line-through' : 'none' }]}>{item.title}</Text>
-      <Text style={[s.meta, { color: palette.muted }]}>{when(item.createdAt)}</Text>
-    </View>
-    {item.audioUri && <View style={s.noteAudio}><AudioPlayback uri={item.audioUri} palette={palette} /></View>}
-  </Pressable>;
+  const swipeResponder = PanResponder.create({
+    onMoveShouldSetPanResponder: (_event, gesture) => Math.abs(gesture.dx) > 9 && Math.abs(gesture.dx) > Math.abs(gesture.dy) * 1.25,
+    onPanResponderGrant: () => { swipeAnchor.value = swipeX.value; },
+    // PanResponder callbacks run on touch events; Reanimated values are intentionally updated here.
+    // eslint-disable-next-line react-hooks/immutability
+    onPanResponderMove: (_event, gesture) => { swipeX.value = Math.max(-92, Math.min(0, swipeAnchor.value + gesture.dx)); },
+    onPanResponderRelease: (_event, gesture) => {
+      const reveal = gesture.dx < -38 || swipeX.value < -46;
+      // eslint-disable-next-line react-hooks/immutability
+      swipeX.value = withSpring(reveal ? -92 : 0, { damping: 20, stiffness: 220 });
+      swipeAnchor.value = reveal ? -92 : 0;
+    },
+    onPanResponderTerminate: () => {
+      // eslint-disable-next-line react-hooks/immutability
+      swipeX.value = withSpring(0, { damping: 20, stiffness: 220 });
+      swipeAnchor.value = 0;
+    },
+  });
+  return <View style={[s.swipeNoteWrap, compact && s.entryCompact, { backgroundColor: palette.surfaceAlt }]}>
+    <Pressable accessibilityRole="button" accessibilityLabel="Xóa ghi chú" onPress={onDelete} style={[s.swipeDelete, { backgroundColor: '#C84535' }]}><Text style={{ color: '#FFFFFF', fontSize: 14, fontWeight: '700' }}>Xóa</Text></Pressable>
+    <Animated.View {...swipeResponder.panHandlers} style={[s.swipeNoteCard, swipeStyle]}>
+      <Pressable onPress={onOpen} style={({ pressed }) => [s.noteRow, { backgroundColor: done ? palette.surfaceAlt : palette.surface, borderColor: palette.line, opacity: done ? 0.58 : pressed ? 0.82 : 1 }]}>
+        <Pressable onPress={(event) => { event.stopPropagation(); onToggle(); }} accessibilityRole="checkbox" accessibilityState={{ checked: done }} accessibilityLabel={done ? 'Đánh dấu ghi chú chưa hoàn thành' : 'Đánh dấu ghi chú hoàn thành'} hitSlop={6} style={[s.check, { borderColor: done ? palette.green : palette.line, backgroundColor: done ? palette.green : 'transparent' }]}><Text style={{ color: '#FFFFFF', fontSize: 17, fontWeight: '700' }}>{done ? '✓' : ''}</Text></Pressable>
+        <View style={[s.noteRowPet, { backgroundColor: palette.surfaceAlt }]}><Animated.Image source={petIcon} style={[{ width: 32, height: 32 }, petStageStyle]} /><Animated.Text pointerEvents="none" style={[s.bloomFlower, s.bloomLeft, bloomStyle, { color: palette.pink }]}>✿</Animated.Text><Animated.Text pointerEvents="none" style={[s.bloomFlower, s.bloomTop, bloomStyle, { color: palette.accent }]}>✿</Animated.Text><Animated.Text pointerEvents="none" style={[s.bloomFlower, s.bloomRight, bloomStyle, { color: palette.yellow }]}>✿</Animated.Text></View>
+        <View style={{ flex: 1, minWidth: 0 }}>
+          <Text numberOfLines={1} style={[s.entryTitle, { color: done ? palette.muted : palette.ink, textDecorationLine: done ? 'line-through' : 'none' }]}>{item.title}</Text>
+          <Text style={[s.meta, { color: palette.muted }]}>{when(item.createdAt)}</Text>
+        </View>
+        {item.audioUri && <View style={s.noteAudio}><AudioPlayback uri={item.audioUri} palette={palette} /></View>}
+      </Pressable>
+    </Animated.View>
+  </View>;
 }
 function Empty({ palette, emoji, title, label, onPress, petIcon }: { palette: (typeof palettes)[ThemeName]; emoji: string; title: string; label: string; onPress: () => void; petIcon?: number }) {
   return <View style={[s.empty, { backgroundColor: palette.surface, borderColor: palette.line }]}>{petIcon ? <Image source={petIcon} style={s.emptyPet} /> : <Text style={{ fontSize: 32 }}>{emoji}</Text>}<Text style={[s.sectionTitle, { color: palette.ink }]}>{title}</Text><Button label={label} primary palette={palette} onPress={onPress} /></View>;
@@ -970,6 +1025,7 @@ const s = StyleSheet.create({
   calendarGlyph: { width: 24, height: 23, borderWidth: 2, borderRadius: 5, marginTop: 3, overflow: 'visible' }, calendarHeader: { height: 6, borderTopLeftRadius: 2, borderTopRightRadius: 2, marginTop: 2, marginHorizontal: 2 }, calendarDays: { flexDirection: 'row', flexWrap: 'wrap', gap: 3, padding: 4 }, calendarDay: { width: 4, height: 4, borderRadius: 1 }, calendarRing: { position: 'absolute', top: -4, width: 3, height: 7, borderRadius: 2 },
   slidersGlyph: { width: 25, gap: 5 }, sliderTrackRow: { height: 5, justifyContent: 'center' }, sliderTrack: { height: 2, width: 24, borderRadius: 2 }, sliderKnob: { position: 'absolute', top: 0, width: 6, height: 6, borderRadius: 3, borderWidth: 1.5 },
   empty: { alignItems: 'center', gap: 8, padding: 21, borderWidth: 1, borderRadius: 18 }, emptyPet: { width: 84, height: 84 }, placeholderPet: { width: 70, height: 70 }, noteGrid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', marginTop: 4 },
+  swipeNoteWrap: { minHeight: 68, borderRadius: 15, overflow: 'hidden', position: 'relative', justifyContent: 'center' }, swipeNoteCard: { width: '100%', zIndex: 1 }, swipeDelete: { position: 'absolute', right: 0, top: 0, bottom: 0, width: 92, alignItems: 'center', justifyContent: 'center' },
   noteRow: { minHeight: 68, borderWidth: 1, borderRadius: 15, padding: 8, flexDirection: 'row', alignItems: 'center', gap: 8 }, noteRowPhoto: { width: 52, height: 52, borderRadius: 10 }, noteRowPet: { width: 40, height: 40, borderRadius: 12, alignItems: 'center', justifyContent: 'center', position: 'relative', overflow: 'visible' }, noteAudio: { width: 128 }, entryAudio: { width: 142, marginTop: 7 },
   note: { borderWidth: 1, borderRadius: 5, padding: 9, marginBottom: 2, minHeight: 165, shadowColor: '#654B3D', shadowOpacity: 0.07, shadowRadius: 6, shadowOffset: { width: 1, height: 3 }, elevation: 1 },
   photo: { width: '100%', height: 95, borderRadius: 4, marginBottom: 8, backgroundColor: '#EADFD4' }, photoPlaceholder: { justifyContent: 'center', alignItems: 'center' },
