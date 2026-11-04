@@ -99,7 +99,7 @@ function calendarHeading(date: Date, mode: CalendarViewMode): string {
   return `${date.toLocaleDateString('vi-VN', { day: 'numeric', month: 'short' })} – ${end.toLocaleDateString('vi-VN', { day: 'numeric', month: 'short', year: 'numeric' })}`;
 }
 export default function HomeScreen() {
-  const { width } = useWindowDimensions();
+  const { width, height } = useWindowDimensions();
   const [tab, setTab] = useState<Tab>('today');
   const [calendarSection, setCalendarSection] = useState<CalendarSection>('events');
   const [calendarMode, setCalendarMode] = useState<CalendarViewMode>('month');
@@ -154,7 +154,7 @@ export default function HomeScreen() {
     return RecordingPresets.HIGH_QUALITY;
   }, []);
   const recorder = useAudioRecorder(recordingOptions);
-  const recorderState = useAudioRecorderState(recorder);
+  const recorderState = useAudioRecorderState(recorder, 100);
   const tablet = width >= 760;
   const colors = palettes[data.theme];
   const copy = themeCopy[data.theme];
@@ -511,18 +511,28 @@ export default function HomeScreen() {
   async function record() {
     if (recordingOperationRef.current) return;
     recordingOperationRef.current = true;
+    let phase: 'starting' | 'stopping' | 'saving' = 'starting';
     try {
-      if (recorderState.isRecording) {
-        if (Platform.OS === 'web') await stopBrowserTranscription();
+      // Read the recorder's live native/browser state. recorderState is intentionally
+      // polled for rendering and can lag behind a tap by up to its polling interval.
+      if (recorder.isRecording) {
+        phase = 'stopping';
+        if (Platform.OS === 'web') {
+          try { await stopBrowserTranscription(); }
+          catch (error) { console.warn('Could not stop live speech recognition cleanly', error); }
+        }
         await recorder.stop();
-        if (recorder.uri) {
-          const fallbackExtension = Platform.OS === 'ios' ? '.mp3' : '.m4a';
-          const uri = await saveMedia(recorder.uri, fallbackExtension);
-          setAudioUri(uri); setDraft((value) => ({ ...value, audioUri: uri }));
-          if (composerMode === 'voice') {
-            pendingVoiceAudioRef.current = uri;
-            if (Platform.OS !== 'web') transcribe(uri);
-          }
+        const recordedUri = recorder.uri || recorder.getStatus().url || undefined;
+        if (!recordedUri) {
+          throw new Error('Recorder stopped without returning an audio file.');
+        }
+        phase = 'saving';
+        const fallbackExtension = Platform.OS === 'ios' ? '.mp3' : '.m4a';
+        const uri = await saveMedia(recordedUri, fallbackExtension);
+        setAudioUri(uri); setDraft((value) => ({ ...value, audioUri: uri }));
+        if (composerMode === 'voice') {
+          pendingVoiceAudioRef.current = uri;
+          if (Platform.OS !== 'web') transcribe(uri);
         }
       } else {
         let permission = await getRecordingPermissionsAsync();
@@ -539,8 +549,16 @@ export default function HomeScreen() {
         await recorder.prepareToRecordAsync(); recorder.record();
         if (Platform.OS === 'web') startBrowserTranscription();
       }
-    } catch { Alert.alert('Chưa ghi âm được', 'Kiểm tra quyền micro rồi thử lại nhé.'); }
-    finally { setTimeout(() => { recordingOperationRef.current = false; }, 220); }
+    } catch (error) {
+      console.error('Voice recording operation failed', { phase, error });
+      if (phase === 'saving') {
+        Alert.alert('Đã ghi nhưng chưa lưu được file', 'Bản thu chưa được đưa vào kho lưu trữ. Hãy thử ghi lại khi thiết bị còn đủ dung lượng.');
+      } else if (phase === 'stopping') {
+        Alert.alert('Chưa hoàn tất bản ghi', 'Không lấy được file âm thanh sau khi dừng. Hãy thử lại và kiểm tra dung lượng thiết bị.');
+      } else {
+        Alert.alert('Chưa bắt đầu ghi âm được', 'Kiểm tra quyền micro, thử đóng ứng dụng đang dùng micro khác rồi ghi lại.');
+      }
+    } finally { recordingOperationRef.current = false; }
   }
   function startBrowserTranscription() {
     const SpeechRecognition = (window as SpeechWindow).SpeechRecognition || (window as SpeechWindow).webkitSpeechRecognition;
@@ -640,13 +658,17 @@ export default function HomeScreen() {
     // eslint-disable-next-line react-hooks/immutability
     onPanResponderMove: (_event, gesture) => { composerDragY.value = Math.max(0, gesture.dy); },
     onPanResponderRelease: (_event, gesture) => {
-      if (gesture.dy > 115) {
+      if (gesture.dy > height * 0.2) {
         void closeComposer();
         // eslint-disable-next-line react-hooks/immutability
         composerDragY.value = 0;
       } else {
         composerDragY.value = withSpring(0, { damping: 22, stiffness: 220 });
       }
+    },
+    onPanResponderTerminate: () => {
+      // eslint-disable-next-line react-hooks/immutability
+      composerDragY.value = withSpring(0, { damping: 22, stiffness: 220 });
     },
   });
   const eventSwipe = PanResponder.create({
@@ -655,13 +677,17 @@ export default function HomeScreen() {
     // eslint-disable-next-line react-hooks/immutability
     onPanResponderMove: (_event, gesture) => { eventDragY.value = Math.max(0, gesture.dy); },
     onPanResponderRelease: (_event, gesture) => {
-      if (gesture.dy > 115) {
+      if (gesture.dy > height * 0.2) {
         setEventDetail(null);
         // eslint-disable-next-line react-hooks/immutability
         eventDragY.value = 0;
       } else {
         eventDragY.value = withSpring(0, { damping: 22, stiffness: 220 });
       }
+    },
+    onPanResponderTerminate: () => {
+      // eslint-disable-next-line react-hooks/immutability
+      eventDragY.value = withSpring(0, { damping: 22, stiffness: 220 });
     },
   });
 
@@ -883,6 +909,7 @@ function NoteRow({ item, palette, onOpen, onToggle, onDelete, petIcon, compact }
   const bloom = useSharedValue(0);
   const swipeX = useSharedValue(0);
   const swipeAnchor = useSharedValue(0);
+  const [rowWidth, setRowWidth] = useState(0);
   const bloomStyle = useAnimatedStyle(() => ({ opacity: interpolate(bloom.value, [0, 0.2, 1], [0, 1, 0]), transform: [{ scale: interpolate(bloom.value, [0, 0.35, 1], [0.25, 1.2, 1.45]) }, { translateY: interpolate(bloom.value, [0, 1], [5, -10]) }] }));
   const swipeStyle = useAnimatedStyle(() => ({ transform: [{ translateX: swipeX.value }] }));
   useEffect(() => {
@@ -900,12 +927,19 @@ function NoteRow({ item, palette, onOpen, onToggle, onDelete, petIcon, compact }
     onPanResponderGrant: () => { swipeAnchor.value = swipeX.value; },
     // PanResponder callbacks run on touch events; Reanimated values are intentionally updated here.
     // eslint-disable-next-line react-hooks/immutability
-    onPanResponderMove: (_event, gesture) => { swipeX.value = Math.max(-92, Math.min(0, swipeAnchor.value + gesture.dx)); },
+    onPanResponderMove: (_event, gesture) => { swipeX.value = Math.max(-rowWidth, Math.min(0, swipeAnchor.value + gesture.dx)); },
     onPanResponderRelease: (_event, gesture) => {
-      const reveal = gesture.dx < -38 || swipeX.value < -46;
-      // eslint-disable-next-line react-hooks/immutability
-      swipeX.value = withSpring(reveal ? -92 : 0, { damping: 20, stiffness: 220 });
-      swipeAnchor.value = reveal ? -92 : 0;
+      const endX = Math.max(-rowWidth, Math.min(0, swipeAnchor.value + gesture.dx));
+      if (gesture.dx < 0 && rowWidth > 0 && Math.abs(endX) > rowWidth * 0.5) {
+        // Reveal the full red layer as the card leaves, then remove the item.
+        // eslint-disable-next-line react-hooks/immutability
+        swipeX.value = withTiming(-rowWidth, { duration: 150 });
+        swipeAnchor.value = -rowWidth;
+        setTimeout(onDelete, 160);
+      } else {
+        swipeX.value = withSpring(0, { damping: 20, stiffness: 220 });
+        swipeAnchor.value = 0;
+      }
     },
     onPanResponderTerminate: () => {
       // eslint-disable-next-line react-hooks/immutability
@@ -913,7 +947,7 @@ function NoteRow({ item, palette, onOpen, onToggle, onDelete, petIcon, compact }
       swipeAnchor.value = 0;
     },
   });
-  return <View style={[s.swipeNoteWrap, compact && s.entryCompact, { backgroundColor: palette.surfaceAlt }]}>
+  return <View onLayout={(event) => { const nextWidth = event.nativeEvent.layout.width; if (nextWidth !== rowWidth) setRowWidth(nextWidth); }} style={[s.swipeNoteWrap, compact && s.entryCompact, { backgroundColor: palette.surfaceAlt }]}>
     <Pressable accessibilityRole="button" accessibilityLabel="Xóa ghi chú" onPress={onDelete} style={[s.swipeDelete, { backgroundColor: '#C84535' }]}><Text style={{ color: '#FFFFFF', fontSize: 14, fontWeight: '700' }}>Xóa</Text></Pressable>
     <Animated.View {...swipeResponder.panHandlers} style={[s.swipeNoteCard, swipeStyle]}>
       <Pressable onPress={onOpen} style={({ pressed }) => [s.noteRow, { backgroundColor: done ? palette.surfaceAlt : palette.surface, borderColor: palette.line, opacity: done ? 0.58 : pressed ? 0.82 : 1 }]}>
@@ -1025,7 +1059,7 @@ const s = StyleSheet.create({
   calendarGlyph: { width: 24, height: 23, borderWidth: 2, borderRadius: 5, marginTop: 3, overflow: 'visible' }, calendarHeader: { height: 6, borderTopLeftRadius: 2, borderTopRightRadius: 2, marginTop: 2, marginHorizontal: 2 }, calendarDays: { flexDirection: 'row', flexWrap: 'wrap', gap: 3, padding: 4 }, calendarDay: { width: 4, height: 4, borderRadius: 1 }, calendarRing: { position: 'absolute', top: -4, width: 3, height: 7, borderRadius: 2 },
   slidersGlyph: { width: 25, gap: 5 }, sliderTrackRow: { height: 5, justifyContent: 'center' }, sliderTrack: { height: 2, width: 24, borderRadius: 2 }, sliderKnob: { position: 'absolute', top: 0, width: 6, height: 6, borderRadius: 3, borderWidth: 1.5 },
   empty: { alignItems: 'center', gap: 8, padding: 21, borderWidth: 1, borderRadius: 18 }, emptyPet: { width: 84, height: 84 }, placeholderPet: { width: 70, height: 70 }, noteGrid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', marginTop: 4 },
-  swipeNoteWrap: { minHeight: 68, borderRadius: 15, overflow: 'hidden', position: 'relative', justifyContent: 'center' }, swipeNoteCard: { width: '100%', zIndex: 1 }, swipeDelete: { position: 'absolute', right: 0, top: 0, bottom: 0, width: 92, alignItems: 'center', justifyContent: 'center' },
+  swipeNoteWrap: { minHeight: 68, borderRadius: 15, overflow: 'hidden', position: 'relative', justifyContent: 'center' }, swipeNoteCard: { width: '100%', zIndex: 1 }, swipeDelete: { position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, alignItems: 'center', justifyContent: 'flex-end', paddingRight: 20, flexDirection: 'row' },
   noteRow: { minHeight: 68, borderWidth: 1, borderRadius: 15, padding: 8, flexDirection: 'row', alignItems: 'center', gap: 8 }, noteRowPhoto: { width: 52, height: 52, borderRadius: 10 }, noteRowPet: { width: 40, height: 40, borderRadius: 12, alignItems: 'center', justifyContent: 'center', position: 'relative', overflow: 'visible' }, noteAudio: { width: 128 }, entryAudio: { width: 142, marginTop: 7 },
   note: { borderWidth: 1, borderRadius: 5, padding: 9, marginBottom: 2, minHeight: 165, shadowColor: '#654B3D', shadowOpacity: 0.07, shadowRadius: 6, shadowOffset: { width: 1, height: 3 }, elevation: 1 },
   photo: { width: '100%', height: 95, borderRadius: 4, marginBottom: 8, backgroundColor: '#EADFD4' }, photoPlaceholder: { justifyContent: 'center', alignItems: 'center' },
